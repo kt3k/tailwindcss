@@ -1,780 +1,1392 @@
-# Tailwind CSS v4 コア + CLI 移植仕様 (SPEC)
+# Loom Compiler Specification
 
-本書は、Tailwind CSS v4 (このリポジトリの `packages/tailwindcss` と `packages/@tailwindcss-cli`、`crates/oxide`) の
-機能のうち **コア API (`compile` / `build`) と CLI** を別言語で再実装するための仕様である。
-参照実装の挙動を正とし、仕様の記述と参照実装が食い違う場合は参照実装 (ファイル名と行を併記) を優先する。
+Status: Draft v1 (language-agnostic)
 
-対象バージョン: `tailwindcss@4.3.3` (このリポジトリの `main`)。
+Purpose: Define a compiler that turns a stylesheet plus a set of class-name candidates into a
+complete CSS document, and a command-line tool that drives that compiler from the filesystem.
 
----
+## Normative Language
 
-## 0. スコープ
+The key words `MUST`, `MUST NOT`, `REQUIRED`, `SHOULD`, `SHOULD NOT`, `RECOMMENDED`, `MAY`, and
+`OPTIONAL` in this document are to be interpreted as described in RFC 2119.
 
-### 0.1 実装するもの
+`Implementation-defined` means the behavior is part of the implementation contract, but this
+specification does not prescribe one universal policy. Implementations MUST document the selected
+behavior.
 
-| 領域 | 内容 | 参照実装 |
-| --- | --- | --- |
-| コア API | `compile(css, options) -> { build(candidates) -> css, sources, root, features }` | `src/index.ts` |
-| CSS 入力処理 | CSS パーサ、`@import` / `@reference`、`@theme`、`@source`、`@utility`、`@custom-variant`、`@variant`、`@apply`、`@tailwind utilities`、テーマ関数 (`--theme()`, `--spacing()`, `--alpha()`, `theme()`) | `src/css-parser.ts`, `src/at-import.ts`, `src/apply.ts`, `src/css-functions.ts` |
-| テーマ | CSS 変数ベースのデザイントークンと名前空間解決 | `src/theme.ts` |
-| 候補クラス名 | 文法・パース・印字 | `src/candidate.ts` |
-| バリアント | 組み込みバリアント、複合バリアント、順序づけ | `src/variants.ts` |
-| ユーティリティ | 組み込みユーティリティ (§7 で必須セットを定義)、`@utility` によるユーザー定義 | `src/utilities.ts` |
-| コンパイル | 候補 → AST、ソート、`!important`、プレフィックス | `src/compile.ts`, `src/property-order.ts` |
-| 出力 | AST 最適化 (重複除去、未使用テーマ変数の削除、ネスト展開)、CSS 文字列化 | `src/ast.ts` |
-| ソース走査 | ファイル走査 (自動検出 + `@source`)、候補抽出、増分走査 | `crates/oxide` |
-| CLI | `tailwindcss [build] -i -o -w --poll -m --optimize --cwd --map --silent` | `packages/@tailwindcss-cli` |
+## 1. Problem Statement
 
-### 0.2 実装しないもの
+Loom is a utility-first CSS compiler. Authors write markup that uses short, composable class names
+such as `flex`, `p-4`, `bg-red-500/50`, or `md:hover:underline`. Loom reads one entry stylesheet,
+scans the project's source files for class names that look like utilities, and emits only the CSS
+rules that those class names require.
 
-- v3 互換レイヤー (`@config`、`@plugin`、JS 設定ファイル、JS プラグイン API、`theme()` のドット記法解決)。`src/compat/` 全体。
-- IntelliSense 向け API (`getClassList`、`getVariants`、`candidatesToCss`)、クラスソート API (`getClassOrder`)、正規化 API (`canonicalizeCandidates`) と `canonicalize` サブコマンド。
-- ソースマップ (`--map`)。CLI のフラグは受け付けてもよいが、未対応と明示してよい。
-- Lightning CSS による最適化・最小化。`--minify` / `--optimize` は任意の CSS 最小化器で代替してよい (§12.5)。
-- ブラウザ版、Vite / PostCSS / webpack / Turbopack 連携、アップグレードツール。
-- 言語別プリプロセッサ (Vue / Svelte / Ruby / Pug など) による抽出精度の向上。§11.4 の共通抽出器のみ実装する。
-- ポリフィル (`@property` フォールバック、`color-mix()` フォールバック) は任意 (§10.4)。
+The compiler solves four problems:
 
-### 0.3 用語
+- It generates CSS on demand from a compact class-name grammar, so the output contains only rules
+  that are actually used.
+- It keeps design tokens (colors, spacing, breakpoints, fonts) as CSS custom properties declared in
+  the stylesheet itself, so the theme is versioned with the project and readable by the browser.
+- It lets authors extend the grammar with new utilities and variants using plain CSS directives.
+- It supports an incremental development loop: candidates only accumulate, so a watch process can
+  rebuild by scanning only the files that changed.
 
-| 用語 | 意味 |
-| --- | --- |
-| 候補 (candidate) | ソースから抽出した、ユーティリティクラスかもしれない文字列。例: `md:hover:bg-red-500/50` |
-| ユーティリティ (utility) | 候補のうちバリアントを除いた本体。例: `bg-red-500/50` |
-| ルート (root) | ユーティリティ名の固定部分。例: `bg` |
-| 値 (value) | 名前つき値 (`red-500`)、任意値 (`[#fff]`)、または変数省略形 (`(--x)`) |
-| modifier | `/` の後ろ。例: `50`、`[50%]`、`(--x)` |
-| バリアント (variant) | `:` で区切られた条件。例: `md`、`hover`、`group-hover/name`、`[&_p]` |
-| テーマキー | `@theme` 内の CSS 変数名。例: `--color-red-500` |
-| 名前空間 | テーマキーの接頭辞。例: `--color` |
-| デザインシステム | テーマ + ユーティリティ表 + バリアント表 + キャッシュをまとめたもの |
+Important boundary:
 
----
+- Loom reads source files but never modifies them.
+- Loom's output is deterministic: the same stylesheet and the same candidate set always produce the
+  same CSS, byte for byte, regardless of the order in which candidates were discovered.
+- Class names that do not resolve to a utility produce no output and no error. Only the stylesheet
+  itself can produce compile errors.
 
-## 1. 全体アーキテクチャ
+## 2. Goals
 
+- Parse a stylesheet into an AST that preserves nesting, at-rules, and license comments.
+- Resolve `@import` recursively through a caller-supplied loader.
+- Collect theme tokens from `@theme` blocks and expose them to utilities as `var(...)` references.
+- Parse candidate class names into a structured form covering variants, roots, named values,
+  arbitrary values, variable shorthands, modifiers, negation, and importance.
+- Compile candidates into CSS rules using a registry of built-in utilities and variants.
+- Allow stylesheet-defined utilities (`@utility`), variants (`@custom-variant`), inline variant
+  blocks (`@variant`), and utility inlining (`@apply`).
+- Order generated rules deterministically by variant, then by property, then by name.
+- Serialize flat, non-nested CSS with stable formatting.
+- Remove theme variables and keyframes that nothing references.
+- Discover source files automatically, honor `@source` directives, and extract candidates from
+  arbitrary text with high recall.
+- Provide a CLI with single-shot, watch, and polling modes and optional minification.
+
+## 3. System Overview
+
+### 3.1 Main Components
+
+1. `Stylesheet Parser`
+   - Parses CSS text into the AST defined in Section 4.1.1.
+   - Reports syntax errors with source positions.
+
+2. `Import Resolver`
+   - Expands `@import` and `@reference` using a loader callback.
+   - Wraps imported content in `@layer`, `@media`, and `@supports` as requested.
+
+3. `Directive Collector`
+   - Walks the AST once and registers `@theme`, `@source`, `@utility`, `@custom-variant`,
+     `@variant`, and `@loom utilities`.
+   - Removes directives that must not appear in the output.
+
+4. `Theme`
+   - Stores design tokens keyed by custom-property name.
+   - Resolves candidate values to `var(...)` references or inline values by namespace.
+
+5. `Design System`
+   - Owns the theme, the utility registry, the variant registry, memoization caches, and the set
+     of known-invalid candidates.
+
+6. `Candidate Parser`
+   - Converts a raw class-name string into zero or more structured `Candidate` interpretations.
+
+7. `Utility Registry` and `Variant Registry`
+   - Map roots to compile functions (utilities) and to selector or at-rule transforms (variants).
+
+8. `Compiler`
+   - Compiles candidates into rule nodes, applies variants and importance, and sorts the result.
+
+9. `Optimizer` and `Serializer`
+   - Deduplicates property registrations, hoists root-level nodes, prunes unused theme values,
+     flattens nesting, and prints CSS text.
+
+10. `Scanner`
+    - Enumerates source files from globs and auto-detection rules, extracts candidates, and tracks
+      file modification times for incremental scans.
+
+11. `CLI`
+    - Wires the scanner and the compiler to files, stdin, stdout, watchers, and a minifier.
+
+### 3.2 Abstraction Levels
+
+1. `Stylesheet Layer` (author-defined)
+   - The entry stylesheet, its imports, theme tokens, and custom utilities and variants.
+
+2. `Grammar Layer`
+   - Candidate syntax, variant syntax, value decoding, and validity rules.
+
+3. `Registry Layer`
+   - Built-in utilities and variants, plus those registered from the stylesheet.
+
+4. `Compilation Layer`
+   - Candidate to AST, variant application, ordering, optimization, serialization.
+
+5. `Discovery Layer`
+   - File walking, ignore rules, candidate extraction, incremental scanning.
+
+6. `Host Layer`
+   - CLI argument handling, file IO, watching, polling, minification.
+
+### 3.3 External Dependencies
+
+- A local filesystem for reading the entry stylesheet, bundled stylesheets, and source files.
+- OPTIONAL filesystem event notification for watch mode (polling is the fallback).
+- OPTIONAL CSS minifier for `--minify` and `--optimize`.
+
+## 4. Core Domain Model
+
+### 4.1 Entities
+
+#### 4.1.1 AST Node
+
+The compiler operates on a list of nodes. Every node has a `kind`:
+
+- `rule`
+  - `selector` (string)
+  - `nodes` (list of nodes)
+- `at-rule`
+  - `name` (string, including the leading `@`, for example `@media`)
+  - `params` (string, possibly empty)
+  - `nodes` (list of nodes; empty for statement at-rules such as `@import`)
+- `declaration`
+  - `property` (string)
+  - `value` (string or undefined; undefined declarations are never printed)
+  - `important` (boolean)
+- `comment`
+  - `value` (string, the text between `/*` and `*/`)
+- `context`
+  - `context` (map of string to string or boolean)
+  - `nodes` (list of nodes)
+  - Never printed. Carries metadata such as `base`, `reference`, `theme`, `source`, and
+    `sourceBase` to its subtree.
+- `at-root`
+  - `nodes` (list of nodes)
+  - Never printed in place. Its children are hoisted to the end of the document during
+    optimization (Section 12).
+
+The helper `rule(selector, nodes)` MUST create an `at-rule` when `selector` starts with `@`
+(splitting on the first whitespace into `name` and `params`) and a `rule` otherwise.
+
+#### 4.1.2 Theme Entry
+
+- `key` (string, a custom-property name such as `--color-red-500`)
+- `value` (string)
+- `options` (bit set)
+  - `INLINE` (1): consumers embed the raw value instead of `var(...)`.
+  - `REFERENCE` (2): the variable is not printed; consumers embed `var(key, value)`.
+  - `DEFAULT` (4): a later non-default entry with the same key wins even if it was added first.
+  - `STATIC` (8): the variable is printed even when unused.
+  - `USED` (16): something referenced the variable.
+
+#### 4.1.3 Candidate
+
+A parsed class name.
+
+- `kind` (`static`, `functional`, or `arbitrary`)
+- `raw` (string, the original class name including variants and the important marker)
+- `variants` (list of `Variant`, in application order: the rightmost variant in the source text is
+  first)
+- `important` (boolean)
+- For `static`: `root` (string)
+- For `functional`: `root` (string), `value` (`Value` or null), `modifier` (`Modifier` or null)
+- For `arbitrary`: `property` (string), `value` (string), `modifier` (`Modifier` or null)
+
+#### 4.1.4 Value
+
+- `named`
+  - `value` (string, for example `red-500`)
+  - `fraction` (string or null, for example `1/2` when a slash segment could be a fraction)
+- `arbitrary`
+  - `value` (string, decoded)
+  - `dataType` (string or null, an explicit type hint such as `color`)
+
+#### 4.1.5 Modifier
+
+- `named`
+  - `value` (string, for example `50`)
+- `arbitrary`
+  - `value` (string, decoded; variable shorthands are stored as `var(--name)`)
+
+#### 4.1.6 Variant
+
+- `static`
+  - `root` (string)
+- `functional`
+  - `root` (string)
+  - `value` (`{ kind: named | arbitrary, value }` or null)
+  - `modifier` (`Modifier` or null)
+- `compound`
+  - `root` (string)
+  - `modifier` (`Modifier` or null)
+  - `variant` (`Variant`, the inner variant)
+- `arbitrary`
+  - `selector` (string)
+  - `relative` (boolean, true when the selector starts with `>`, `+`, or `~`)
+
+#### 4.1.7 Utility Definition
+
+- `kind` (`static` or `functional`)
+- `compile` (function from `Candidate` to one of: a list of nodes, `undefined`, or `null`)
+  - A list of nodes means success.
+  - `undefined` means this definition does not handle the candidate; try the next definition.
+  - `null` means the candidate is invalid for this definition. When the definition declares
+    `types`, the compiler MUST stop trying further definitions for this root.
+- `types` (OPTIONAL list of data-type names; a definition whose `types` has more than one entry and
+  includes `any` is a fallback definition tried only after all others fail)
+
+Several definitions MAY share one root.
+
+#### 4.1.8 Variant Definition
+
+- `kind` (`static`, `functional`, or `compound`)
+- `order` (integer, registration order)
+- `apply` (function that mutates a rule node in place, or returns `null` to reject)
+- `compounds` (bit set: `NEVER` = 0, `AT_RULES` = 1, `STYLE_RULES` = 2; the kinds of rules this
+  variant generates)
+- `compoundsWith` (bit set; the kinds of inner rules a compound variant accepts)
+
+#### 4.1.9 Design System
+
+- `theme` (`Theme`)
+- `utilities` (map from root to list of `Utility Definition`)
+- `variants` (map from name to `Variant Definition`, plus per-order comparison functions)
+- `invalidCandidates` (set of raw strings)
+- `important` (boolean; when true every generated declaration is marked `!important`)
+- Memoized operations: `parseCandidate(raw)`, `parseVariant(raw)`, `compileAstNodes(candidate,
+  flags)`, `getVariantOrder()`.
+- `parseVariant` MUST return the same object for the same input string within one design system,
+  because variant ordering (Section 9.4) relies on identity.
+
+#### 4.1.10 Source Entry
+
+- `base` (absolute directory path)
+- `pattern` (glob relative to `base`)
+- `negated` (boolean)
+
+#### 4.1.11 Compiler Handle
+
+Returned by `compile` (Section 15.1).
+
+- `sources` (list of `Source Entry` collected from `@source`)
+- `root` (`null`, the string `none`, or a `Source Entry` without `negated`; from
+  `@loom utilities source(...)`)
+- `features` (bit set: `AT_APPLY` = 1, `AT_IMPORT` = 2, `THEME_FUNCTION` = 8, `UTILITIES` = 16,
+  `VARIANTS` = 32, `AT_THEME` = 64)
+- `build(candidates)` (function from a list of raw strings to CSS text)
+
+### 4.2 Stable Identifiers and Normalization Rules
+
+- `Class selector`
+  - The selector for a candidate is `.` followed by the CSS-escaped `raw` string. Escaping MUST
+    match `CSS.escape`: a leading digit, a digit after a leading `-`, and control characters
+    become `\<hex> `; ASCII letters, digits, `-`, `_`, and non-ASCII pass through; everything
+    else is prefixed with `\`. A lone `-` becomes `\-`.
+- `segment(input, separator)`
+  - Splits on a single-character separator, ignoring separators inside `(...)`, `[...]`, `{...}`,
+    inside single or double quotes, and immediately after a backslash. A closing bracket pops the
+    stack only when it matches the most recent opener.
+- `decodeArbitraryValue(input)`
+  - When `input` contains no `(`: replace `\_` with `_` and every other `_` with a space.
+  - Otherwise parse the value into words, separators, and function calls. Inside `url(...)` (and
+    any function whose name ends in `_url`) nothing is replaced. Inside `var(...)` and
+    `theme(...)` the first argument keeps its underscores (only `\_` is unescaped); other arguments
+    are decoded recursively. Everywhere else `_` becomes a space. Finally insert spaces around
+    `+`, `-`, `*`, and `/` inside math functions (`calc`, `min`, `max`, `clamp`, and similar) when
+    they act as operators, so `calc(1px+2px)` becomes `calc(1px + 2px)`.
+- `isValidArbitrary(input)`
+  - Track `(` and `[` on a stack. Return false on a closing `)`, `]`, or `}` with an empty stack,
+    on a mismatched closer, or on a top-level `;`. Quoted text and backslash-escaped characters are
+    skipped. `{` is not pushed.
+- `Named value pattern`
+  - Named values and named modifiers MUST match `^[a-zA-Z0-9_.%-]+$`.
+- `Variant name pattern`
+  - Custom variant names MUST match `^@?[a-z0-9][a-zA-Z0-9_-]*` and MUST NOT end in `_` or `-`.
+- `Prefix pattern`
+  - A theme prefix MUST match `^[a-z]+$`.
+- `Numeric predicates`
+  - `isPositiveInteger(v)`: `Number(v)` is an integer, is greater than or equal to 0, and
+    `String(Number(v)) == v`.
+  - `isStrictPositiveInteger(v)`: as above with greater than 0.
+  - `isMultipleOfQuarter(v)`: `Number(v)` is a multiple of 0.25 with no redundant leading or
+    trailing zeros. Used for spacing multipliers and opacity values.
+- `compare(a, z)`
+  - Natural string comparison: compare character by character, but when both strings have a digit
+    at the current position, compare the full digit runs numerically (then lexically on tie).
+- `Brace expansion`
+  - `{a,b,c}` enumerates; `{1..5}`, `{10..0}`, and `{0..20..5}` produce integer ranges (negative
+    bounds allowed, a step of zero is an error); nesting is allowed; unbalanced braces are an
+    error.
+
+## 5. Stylesheet Input Contract
+
+### 5.1 Parsing Requirements
+
+- The parser MUST accept standard CSS including nested rules, nested at-rules, the `&` nesting
+  selector, and custom properties.
+- The parser MUST drop ordinary comments and MUST keep comments that start with `/*!` as `comment`
+  nodes.
+- The parser MUST split `!important` from a declaration value and set `important`.
+- The parser MUST accept a missing `;` before `}`.
+- `;`, `{`, and `}` inside quotes or parentheses MUST NOT be treated as delimiters.
+- Malformed input (for example an unclosed block) MUST raise a syntax error carrying the source
+  position.
+- Statement at-rules (those terminated by `;`) MUST produce `at-rule` nodes with empty `nodes`.
+
+### 5.2 Serialization Format
+
+The serializer prints nodes recursively with two-space indentation per depth and `\n` after every
+line:
+
+- Declaration: `<indent><property>: <value>;` with ` !important` inserted before `;` when
+  `important` is true. Declarations whose `value` is undefined are skipped.
+- Rule: `<indent><selector> {`, the children at depth + 1, then `<indent>}`.
+- At-rule with children: `<indent><name> <params> {` (or `<indent><name> {` when `params` is
+  empty), the children, then `<indent>}`.
+- At-rule without children: `<indent><name> <params>;`.
+- Comment: `<indent>/*<value>*/`.
+- Context: children printed at the same depth.
+
+## 6. Directive Processing
+
+### 6.1 Processing Order
+
+`compile` wraps the parsed AST in a `context` node carrying `base` and then performs these steps in
+order:
+
+1. Resolve `@import` and `@reference` (Section 6.2).
+2. Walk the AST once and collect directives (Sections 6.4 through 6.8).
+3. Build the design system from the theme. Apply `important` if requested. Add every
+   `@source not inline(...)` candidate to `invalidCandidates`.
+4. Reserve every custom variant name in stylesheet order, then register custom variants in
+   topological order of their `@variant` dependencies (Section 6.7).
+5. Register custom utilities (Section 6.8).
+6. Replace the first `@theme` with `:root, :host { ... }` containing every theme variable that is
+   not `REFERENCE` (Section 7.5). Hoist theme keyframes to the document root.
+7. Expand nested `@variant` blocks (Section 6.9).
+8. Substitute theme functions (Section 6.11).
+9. Expand `@apply` (Section 6.10).
+10. Convert the `@loom utilities` node into an empty `context` node; `build` fills it later.
+11. Remove any remaining `@utility` nodes.
+
+### 6.2 `@import` and `@reference`
+
+Syntax: `@import "<uri>" [layer(<name>)] [supports(<condition>)] [<media query list>];`
+
+- The URI MUST be quoted. `url(...)` imports, `data:` URIs, and `http://` or `https://` URIs MUST
+  be left untouched in the output.
+- The loader callback receives `(uri, base)` and returns `{ path, base, content }`. The loaded
+  content is parsed and its own imports are resolved recursively. Recursion deeper than 100 levels
+  MUST raise an error.
+- The loaded AST is wrapped in `context { base: <loaded base> }`, then in `@layer <name>` when
+  `layer(...)` is present, then in `@media <query>` when a media query list is present, then in
+  `@supports (<condition>)` when `supports(...)` is present.
+- `layer(...)` MUST appear before `supports(...)` and before media queries; otherwise raise an
+  error.
+- `@reference "<uri>";` is equivalent to `@import "<uri>" reference;`.
+- `AT_IMPORT` is added to `features` whenever an import is resolved.
+
+Media-position parameters recognized after import expansion (the resolver turns them into
+`@media <params> { ... }`; the collector interprets them and removes the ones it consumes; when
+every parameter is consumed the `@media` wrapper is removed and its children are spliced in place):
+
+- `reference`: wrap the children in `context { reference: true }`.
+- `theme(<options>)`: append `<options>` to the `params` of every `@theme` inside. When the options
+  include `reference`, any non-`@theme` rule inside MUST raise an error.
+- `prefix(<ident>)`: append `prefix(<ident>)` to every `@theme` inside.
+- `important`: set the design system's `important` flag.
+- `source(<path>)`: rewrite the first `@loom utilities` inside to `@loom utilities source(<path>)`
+  and wrap it in `context { sourceBase: <base of the importing file> }`.
+
+### 6.3 Bundled Stylesheets
+
+An implementation MUST ship four stylesheets and MUST resolve the import id `loom` to the entry
+file among them:
+
+- `index.css`: `@layer theme, base, components, utilities;` followed by `@import './theme.css'
+  layer(theme);`, `@import './preflight.css' layer(base);`, and `@import './utilities.css'
+  layer(utilities);`.
+- `theme.css`: a single `@theme default { ... }` block declaring the default color palette,
+  `--spacing`, breakpoints, container widths, font families, text sizes with `--line-height`
+  sub-keys, font weights, tracking, leading, radii, shadows, easing curves, animations with their
+  `@keyframes`, blur values, and `--default-*` settings.
+- `preflight.css`: base element resets.
+- `utilities.css`: the single statement `@loom utilities;`.
+
+The default theme values that this specification's examples depend on are:
+
+- `--spacing: 0.25rem`
+- `--breakpoint-sm: 40rem`, `--breakpoint-md: 48rem`, `--breakpoint-lg: 64rem`,
+  `--breakpoint-xl: 80rem`, `--breakpoint-2xl: 96rem`
+- `--container-md: 28rem` (and the other container sizes from `3xs` to `7xl`)
+- `--text-lg: 1.125rem` with `--text-lg--line-height: calc(1.75 / 1.125)`
+- `--radius-lg: 0.5rem`
+- `--font-weight-bold: 700`
+- `--color-red-500: oklch(63.7% 0.237 25.331)`
+- `--default-transition-duration: 150ms`
+- `--default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1)`
+
+### 6.4 `@loom utilities [source(...)]`
+
+- Only the first occurrence is kept; later occurrences MUST be removed.
+- An occurrence inside `context { reference: true }` MUST be removed and ignored.
+- `source(none)` sets `root` to `none` (auto-detection disabled).
+- `source("<path>")` sets `root` to `{ base: sourceBase or base, pattern: <path> }`. An unquoted
+  path MUST raise an error.
+- `UTILITIES` is added to `features`.
+
+### 6.5 `@theme [options] { ... }`
+
+- `params` is a whitespace-separated list of `reference`, `inline`, `default`, `static`, and
+  `prefix(<ident>)`.
+- A `@theme` inside `context { reference: true }` is treated as `reference`.
+- An invalid prefix MUST raise an error. A valid prefix is stored on the theme.
+- Children MUST be custom-property declarations, `@keyframes`, or comments. Anything else MUST
+  raise an error that includes a snippet of the offending block.
+- Declarations are registered with `theme.add(unescape(property), value, options)`
+  (Section 7.2). `@keyframes` blocks are stored on the theme.
+- The first `@theme` is replaced with an empty `:root, :host` rule (filled in step 6 of
+  Section 6.1). Later `@theme` blocks are removed.
+- `AT_THEME` is added to `features`.
+
+### 6.6 `@source`
+
+Forms:
+
+- `@source "<glob>";` adds `{ base, pattern, negated: false }` to `sources`, where `base` is the
+  `base` of the enclosing `context`.
+- `@source not "<glob>";` adds the same entry with `negated: true`.
+- `@source inline("<patterns>");` splits the quoted text on whitespace, brace-expands each item, and
+  appends the results to the inline candidate list. Inline candidates are included in every
+  `build` as if they had been scanned.
+- `@source not inline("<patterns>");` does the same but adds the results to `invalidCandidates`.
+
+A `@source` with a body, a nested `@source`, or an unquoted path MUST raise an error. The
+directive is removed from the output.
+
+### 6.7 `@custom-variant`
+
+Both forms MUST be top level (nesting is an error), and the name MUST match the variant name
+pattern. A definition with both a selector and a body, or with neither, MUST raise an error.
+
+Selector form: `@custom-variant <name> (<selector>[, <selector>...]);`
+
+- The parenthesized text is split on commas with `segment`. Empty items MUST raise an error.
+- Items starting with `@` are at-rule selectors; the rest are style selectors.
+- At application time, the variant produces one `rule` whose selector joins the style selectors
+  with `, ` (when any exist) followed by one `at-rule` per at-rule item, each receiving the
+  utility's nodes as children.
+- `compounds` is computed with `compoundsForSelectors` (Section 9.1).
+
+Body form: `@custom-variant <name> { ... @slot; ... }`
+
+- At application time the body is cloned, every `@slot` is replaced by the utility's nodes, and
+  `@keyframes` and `@property` inside the body are wrapped in `at-root`.
+- Nested `@variant <other>` inside the body is allowed. The set of referenced names forms the
+  variant's dependencies; registration happens in topological order and a cycle MUST raise an
+  error naming the cycle.
+- `compounds` is computed from the selectors and at-rule names found in the body.
+
+Compatibility: a top-level `@variant <name> (...)` without a body, and a top-level
+`@variant <name> { ... }` whose body contains `@slot`, MUST be treated as `@custom-variant`.
+
+### 6.8 `@utility`
+
+Forms:
+
+- `@utility <name> { ... }` registers a static utility. Compiling the candidate `<name>` returns a
+  clone of the body.
+- `@utility <name>-* { ... }` registers a functional utility whose body uses `--value(...)` and
+  `--modifier(...)` (Section 10.6).
+
+Rules:
+
+- MUST be top level. An empty body MUST raise an error.
+- The name is unescaped first (so `@utility foo-1\/2` defines `foo-1/2`).
+- A name that satisfies neither the static nor the functional name rule (Section 10.5) MUST raise
+  an error. The message SHOULD distinguish a name ending in `*` but not `-*`, a `*` in the middle,
+  and other invalid names.
+- `@apply` inside a `@utility` body is expanded first (Section 6.10).
+
+### 6.9 `@variant` (Nested Form)
+
+Inside a style rule: `@variant <v1>[:<v2>...][, <v3>...] { ... }`
+
+- Comma-separated groups are independent alternatives; each produces its own rule.
+- Colon-separated names within a group stack; they are applied from right to left.
+- For each group, create a `rule` with selector `&` containing the block's children (cloning the
+  children for every group but the last), parse each variant name, and apply it
+  (Section 9.3). An empty name, an unknown name, or a rejected application MUST raise an error.
+- If the resulting selector is still `&`, splice its children in place; otherwise replace the
+  `@variant` node with the rule.
+- `VARIANTS` is added to `features`.
+
+### 6.10 `@apply`
+
+Inside a rule: `@apply <candidate> [<candidate>...];`
+
+- A top-level `@apply` is left untouched. An `@apply` inside `@keyframes` MUST raise an error.
+  An `@apply` with a body MUST raise an error.
+- If every argument starts with `--`, the node is a CSS mixin invocation and MUST be left
+  untouched. Mixing `--` arguments with utility candidates MUST raise an error.
+- Otherwise the candidates are compiled with `compileCandidates` using `respectImportant = false`
+  (the design-system-wide `important` flag does not apply; a candidate's own `!` does), and the
+  `@apply` node is replaced by the children of every generated rule. Generated rule selectors are
+  discarded. Variant wrappers are kept, so `@apply hover:underline` yields a nested
+  `&:hover { ... }` (with its `@media`) inside the host rule.
+- Every candidate MUST compile. Otherwise raise an error; the message SHOULD distinguish: a
+  missing prefix when a prefix is configured, a candidate disabled by `@source not inline`, a
+  variant that does not exist, an empty theme (the bundled stylesheet was not imported), and an
+  unknown utility.
+- `@apply` inside `@utility` bodies MAY reference other custom utilities. Build a dependency graph
+  from `@utility` roots referenced by each `@apply`, sort it topologically, and expand in that
+  order. A cycle MUST raise an error naming the offending candidate.
+- `AT_APPLY` is added to `features`.
+
+### 6.11 Theme Functions
+
+The following functions are substituted in declaration values and in the `params` of `@media`,
+`@custom-media`, `@container`, and `@supports`. Arguments are split on commas with `segment` and
+trimmed. `THEME_FUNCTION` is added to `features` whenever a substitution happens.
+
+- `--spacing(<n>)`
+  - Let `m` be the raw `--spacing` theme value. Return `0px` when `n` is `0`, `m` when `n` is
+    `1`, and `calc(m * n)` otherwise.
+  - Missing argument, extra arguments, or a missing `--spacing` value MUST raise an error.
+- `--alpha(<color> / <alpha>)`
+  - Return `withAlpha(color, alpha)` (Section 10.3). A missing slash or extra arguments MUST
+    raise an error.
+- `--theme(<key>[, <fallback>...][ inline])`
+  - `key` MUST start with `--`; otherwise raise an error.
+  - A trailing ` inline` forces inline resolution. Inside an at-rule `params` resolution is always
+    inline.
+  - Resolve with `resolveThemeValue(key, inline)` (Section 7.3). When nothing resolves, return the
+    joined fallback, or raise an error when there is none.
+  - When a fallback exists: if the fallback is `initial`, return the resolved value; if the
+    resolved value is `initial`, return the fallback; if the resolved value starts with `var(`,
+    `theme(`, or `--theme(`, inject the fallback into the innermost such call that has no fallback
+    or whose fallback is `initial`.
+- `theme(<key>[, <fallback>...])`
+  - Legacy form. Strip surrounding quotes from `key`. Resolve with inline resolution. Return the
+    fallback when nothing resolves, or raise an error when there is none.
+
+Values of generated utilities are processed by the same substitution inside `compileAstNodes`. A
+substitution failure there MUST make the candidate invalid instead of raising.
+
+## 7. Theme Resolution
+
+### 7.1 Storage
+
+An ordered map from key to `Theme Entry`, an ordered set of `@keyframes` nodes, and `prefix`
+(string or null).
+
+### 7.2 `add(key, value, options)`
+
+1. If `key` ends in `-*`: `value` MUST be `initial` (otherwise raise an error). `--*` clears every
+   entry; any other key clears the namespace `key` minus `-*` (Section 7.2.1).
+2. If `options` includes `DEFAULT` and an existing entry for `key` lacks `DEFAULT`, return without
+   changing anything.
+3. If `value` is `initial`, delete `key`. Otherwise store or overwrite the entry.
+
+#### 7.2.1 Namespace Clearing and Ignored Keys
+
+Clearing a namespace deletes every key that starts with the namespace, except keys that belong to
+an ignored sub-namespace. The ignored sub-namespaces (each also covers keys with a further `-`
+suffix) are:
+
+- under `--font`: `--font-weight`, `--font-size`
+- under `--inset`: `--inset-shadow`, `--inset-ring`
+- under `--text`: `--text-color`, `--text-decoration-color`, `--text-decoration-thickness`,
+  `--text-indent`, `--text-shadow`, `--text-underline-offset`
+- under `--grid-column`: `--grid-column-start`, `--grid-column-end`
+- under `--grid-row`: `--grid-row-start`, `--grid-row-end`
+
+The same list applies to resolution: resolving `shadow-sm` in the `--text` namespace MUST NOT
+match `--text-shadow-sm`.
+
+### 7.3 Resolution Operations
+
+- `resolveKey(candidateValue, namespaces)`
+  - For each namespace in order: the key is the namespace itself when `candidateValue` is null,
+    otherwise `<namespace>-<candidateValue>`. When the key is absent and `candidateValue` contains
+    `.`, also try the key with every `.` replaced by `_`. Skip ignored keys. Return the first key
+    found, or null.
+- `resolve(candidateValue, namespaces, options)`
+  - Find the key. Return null when absent. When either the call's `options` or the entry's
+    `options` includes `INLINE`, return the raw value. When the entry is `REFERENCE`, return
+    `var(<escaped prefixed key>, <raw value>)`. Otherwise return `var(<escaped prefixed key>)`.
+- `resolveValue(candidateValue, namespaces)`
+  - Find the key and return the raw value, or null.
+- `resolveWith(candidateValue, namespaces, nestedKeys)`
+  - Find the key `k`. For each nested key `n`, look up `k + n` (for example `--text-lg` plus
+    `--line-height` gives `--text-lg--line-height`) and resolve it with the same inline or
+    `var(...)` rule. Return the main value and a map from nested key to value.
+- `get(keys)`
+  - Return the raw value of the first key that exists, or null.
+- `namespace(ns)`
+  - Return a map with a null key for `ns` itself, keys with the `<ns>-` prefix removed, and keys
+    starting with `<ns>--` with only `<ns>` removed (so sub-keys keep their leading `--`).
+- `keysInNamespaces(namespaces)`
+  - Every key under each namespace, with the prefix removed, excluding keys that contain a
+    second `--` and excluding ignored keys.
+- `prefixKey(key)`
+  - When `prefix` is set, `--<prefix>-<key without leading -->`.
+- `markUsedVariable(key)`
+  - Set `USED` on the (unprefixed, unescaped) key. Return true when the flag was not set before.
+- `resolveThemeValue(path, forceInline = true)`
+  - Split off a modifier after the last `/` in `path` (trimmed). Resolve `path` with
+    `resolve(null, [path], INLINE when forceInline)`. When a modifier exists, return
+    `withAlpha(value, modifier)`.
+
+### 7.4 Modes
+
+- `inline`: consumers embed raw values; the variable is still printed.
+- `reference`: the variable is not printed; consumers embed `var(key, value)`.
+- `default`: user-defined entries win regardless of order. The bundled `theme.css` uses this.
+- `static`: the variable is printed even when unused.
+
+### 7.5 Emission
+
+The `:root, :host` rule that replaced the first `@theme` receives one declaration per entry that is
+not `REFERENCE`, in insertion order, as `<escape(prefixKey(key))>: <value>`. The declarations are
+wrapped in `context { theme: true }`. Each stored `@keyframes` is appended to the document as
+`context { theme: true } > at-root > @keyframes`. Entries whose value resolved to `initial` are
+not printed.
+
+### 7.6 Unused Value Removal
+
+During optimization (Section 12.2):
+
+- A theme declaration is removed unless its entry is `STATIC` or `USED`, or some other theme
+  declaration that references it via `var(...)` is itself used (transitively).
+- `USED` is set when a `var(--key)` appears in any non-theme declaration value in the final AST,
+  or when a candidate string of the form `--key` is passed to `build`.
+- When the `:root, :host` rule becomes empty it is removed, together with any enclosing `@layer`
+  rules that become empty.
+- A theme `@keyframes` is removed unless its name appears in an `animation` declaration or in the
+  value of a used `--animate-*` entry.
+
+## 8. Candidate Grammar and Parsing
+
+### 8.1 Surface Grammar
+
+```text
+candidate  := [prefix ":"] { variant ":" } ["!"] utility ["!"]
+utility    := arbitrary-property | static-name | functional
+arbitrary-property := "[" property ":" value "]" [modifier]
+functional := root [ "-" named-value | "-[" [type ":"] value "]" | "-(" [type ":"] "--" ident ")" ] [modifier]
+modifier   := "/" ( named-value | "[" value "]" | "(" "--" ident ")" )
+variant    := "[" selector-or-at-rule "]" | name [ "-" named-value | "-[" value "]" | "-(" "--" ident ")" ] ["/" modifier-value]
 ```
-入力 CSS ──► CSS パース ──► @import 解決 ──► at-rule 収集 ──► デザインシステム構築
-                                                               │
-     (テーマ, @utility, @custom-variant, @source, important...) │
-                                                               ▼
-候補文字列 ──► parseCandidate ──► compileAstNodes ──► ソート ──► @tailwind utilities の位置に挿入
-                                                               │
-                                                               ▼
-                      optimizeAst (重複除去 / 未使用変数削除 / ネスト展開) ──► toCss ──► 出力 CSS
-```
 
-処理は 2 段階に分かれる。
-
-1. **`compile(css)`** (1 回): 入力 CSS を解析してデザインシステムを構築し、`build` 関数を返す。
-2. **`build(candidates)`** (何度でも): 候補の集合からユーティリティ CSS を生成し、入力 CSS 内の `@tailwind utilities` の位置に差し込んだ完全な CSS を返す。候補は **追加のみ** され、一度有効だった候補は以後も出力され続ける。
-
-dev (watch) と prod (build) は同じパイプラインである。違いは、watch では変更ファイルだけを再走査して `build` に差分候補を渡す点と、prod では最後に最小化を通す点だけである (§12)。
-
----
-
-## 2. 公開 API
-
-### 2.1 `compile`
-
-```ts
-compile(css: string, options?: CompileOptions): Promise<Compiler>
-
-type CompileOptions = {
-  base?: string          // 相対パス解決の基準ディレクトリ (既定: '')
-  from?: string          // 入力ファイルパス (ソースマップ用。未対応でよい)
-  polyfills?: Polyfills  // ビットフラグ。既定は All (§10.4)。未対応なら None 相当
-  loadStylesheet?: (id: string, base: string) => Promise<{ path: string; base: string; content: string }>
-  loadModule?: ...       // @plugin / @config 用。本仕様では常にエラーを投げる
-}
-
-type Compiler = {
-  sources: { base: string; pattern: string; negated: boolean }[]  // @source 由来
-  root: null | 'none' | { base: string; pattern: string }          // @tailwind utilities source(…) 由来
-  features: Features                                                // 使用された機能のビットフラグ
-  build(candidates: string[]): string
-}
-```
-
-`Features` ビット: `AtApply=1`, `AtImport=2`, `JsPluginCompat=4`, `ThemeFunction=8`, `Utilities=16`, `Variants=32`, `AtTheme=64`。
-
-`loadStylesheet` が未指定のまま `@import` に到達したらエラー。`loadModule` が未指定のまま `@plugin` / `@config` に到達したらエラー。
-
-### 2.2 `build`
-
-- `features === None` (Tailwind 固有の構文が一切ない) なら、入力 CSS をそのまま返す。
-- `@tailwind utilities` が無ければ、最適化済みの入力 CSS を返す (候補は無視)。
-- 新しい候補を有効候補集合に追加する。`--` で始まる候補は **CSS 変数の使用申告** として扱い、テーマ変数の "使用済み" マークだけ行う (§6.6)。
-- 有効候補集合が変化しなかった場合、前回の出力を返す (参照等価でよい)。
-- そうでなければ、全有効候補を `compileCandidates` (§8) で AST にし、`@tailwind utilities` ノードの子として差し替え、`optimizeAst` (§10) を通して `toCss` で文字列化する。
-- 一度無効と判定した候補は `invalidCandidates` に記録し、以後はパースを省略する。
-
-生成される CSS の先頭には `/*! tailwindcss v<version> | MIT License | https://tailwindcss.com */` を付ける (テスト環境では省略可)。
-
-### 2.3 エラー
-
-構文エラーおよび §4 で「エラー」とした事象は例外として `compile` (または `build`) から送出する。CLI は例外をメッセージ表示して終了コード 1 (watch 中はメッセージ表示のみで継続) とする。
-
----
-
-## 3. CSS パーサと AST
-
-### 3.1 AST ノード
-
-```
-StyleRule   { kind: 'rule',        selector: string, nodes: AstNode[] }
-AtRule      { kind: 'at-rule',     name: string /* '@' を含む */, params: string, nodes: AstNode[] }
-Declaration { kind: 'declaration', property: string, value: string | undefined, important: boolean }
-Comment     { kind: 'comment',     value: string }
-Context     { kind: 'context',     context: Record<string, string|boolean>, nodes: AstNode[] }  // 印字されない。子にメタ情報を渡す
-AtRoot      { kind: 'at-root',     nodes: AstNode[] }  // 印字時にドキュメント末尾へ巻き上げる
-```
-
-`rule(selector, nodes)` ヘルパーは、`selector` が `@` で始まれば `AtRule` (名前と params に分割)、そうでなければ `StyleRule` を作る。
-
-### 3.2 パーサの要件
-
-- 標準的な CSS をネスト構文込みでパースする (`&`、ネストした at-rule)。
-- コメントは通常捨てるが、`/*!` で始まるライセンスコメントは `Comment` として保持する。
-- `!important` を宣言から分離して `important: true` にする。
-- 値の末尾 `;` の省略 (ブロック末尾) を許容する。
-- 引用符と括弧の内側にある `;` `{` `}` を区切りとして扱わない。
-- 不正な入力 (閉じ括弧の不足など) は位置つきの構文エラーを投げる。
-- `@import` などボディを持たない at-rule は `nodes: []` とする。
-
-### 3.3 文字列化 (`toCss`)
-
-```
-<indent>property: value !important;      ← 宣言 (important は " !important")
-<indent>selector {                        ← ルール
-<indent>  ...
-<indent>}
-<indent>@name params {                    ← at-rule (params が空なら "@name {")
-<indent>@name params;                     ← 子を持たない at-rule
-<indent>/*value*/                         ← コメント
-```
-
-インデントは半角スペース 2 個、各行末は `\n`。`Context` は子だけを同じ深さで印字する。`AtRoot` はこの段階では現れない (§10 で解消済み)。値が `undefined` の宣言は印字しない。
-
----
-
-## 4. 入力 CSS の処理 (`parseCss`)
-
-入力 AST を `Context { base }` で包み、以下の順で処理する。
-
-1. `@import` / `@reference` の解決 (§4.1)
-2. at-rule の収集 (§4.2〜4.9)。AST を 1 回走査し、該当 at-rule を登録・除去する
-3. デザインシステム構築 (`buildDesignSystem`)、`important` の設定、`@source not inline(…)` の候補を `invalidCandidates` へ
-4. カスタムバリアントの登録 (§4.7)、カスタムユーティリティの登録 (§4.6)
-5. 最初の `@theme` の位置に `:root, :host { …全テーマ変数… }` を出力 (§6.5)
-6. ネストされた `@variant` の展開 (§4.8)
-7. テーマ関数の置換 (§4.10)
-8. `@apply` の展開 (§4.9)
-9. `@tailwind utilities` ノードを `Context {}` に変換 (子は `build` 時に差し替える)
-10. 残った `@utility` ノードを削除
-
-### 4.1 `@import` と `@reference`
-
-`@import "<uri>" [layer(<name>)] [supports(<cond>)] [<media-query>...];`
-
-- `uri` は引用符必須。`url(…)` 形式、`data:`、`http://`、`https://` は解決せずそのまま残す。
-- `loadStylesheet(uri, base)` で読み込み、再帰的に `@import` を解決する (深さ 100 を超えたらエラー)。
-- 読み込んだ AST を `Context { base: <読み込んだファイルのディレクトリ> }` で包み、`layer(x)` があれば `@layer x { … }`、メディアクエリがあれば `@media <mq> { … }`、`supports(x)` があれば `@supports (x) { … }` の順で内側から包む。
-- `layer(…)` は他の条件より前に書かれていなければエラー。
-- `@reference "x";` は `@import "x" reference;` と同じ。
-- `@import "tailwindcss";` はパッケージの `index.css` を指す。CLI の `loadStylesheet` は Node のモジュール解決 (`node_modules/tailwindcss/index.css`、`exports` の `style` 条件) を行う。移植版では「`tailwindcss` という id は同梱の `index.css` を返す」実装でよい。
-
-同梱すべき CSS ファイル (このリポジトリからそのままコピーする):
-
-| ファイル | 内容 |
-| --- | --- |
-| `index.css` | `@layer theme, base, components, utilities;` + 3 つの `@import` |
-| `theme.css` | `@theme default { … }` (色パレット、spacing、breakpoint、container、text、font、radius、shadow、ease、animate、blur、default-*、`@keyframes`) |
-| `preflight.css` | ブラウザリセット。`@layer base` に入る |
-| `utilities.css` | `@tailwind utilities;` のみ |
-
-`index.css` は `@import './theme.css' layer(theme); @import './preflight.css' layer(base); @import './utilities.css' layer(utilities);` である。
-
-#### `@import` のメディア位置に書ける Tailwind 固有パラメータ
-
-`@import` 解決後、`@media <params>` として現れたものを後処理する。パラメータは空白区切りで解釈し、Tailwind 固有のものを消費して残りを `@media` に残す (全部消費されたら `@media` を外して子を展開する)。
-
-| パラメータ | 効果 |
-| --- | --- |
-| `reference` | 子を `Context { reference: true }` で包む。参照モード (§6.4) |
-| `theme(<opts>)` | 子の `@theme` の params に `<opts>` を追記する。`reference` を含むとき、子に `@theme` 以外のルールがあればエラー |
-| `prefix(<ident>)` | 子の `@theme` に `prefix(<ident>)` を追記する |
-| `important` | デザインシステム全体を `important = true` にする |
-| `source(<path>)` | 子の `@tailwind utilities` を `@tailwind utilities source(<path>)` に書き換え、`Context { sourceBase }` で包む |
-
-例: `@import "tailwindcss" important;`、`@import "tailwindcss" prefix(tw);`、`@import "tailwindcss" source("../src");`、`@import "./theme.css" theme(reference);`。
-
-### 4.2 `@tailwind utilities [source(…)]`
-
-- 最初の 1 つだけを記憶し、2 つ目以降は削除する。
-- `Context { reference: true }` の内側にあれば無視して削除する。
-- `source(none)` → `root = 'none'` (自動検出無効)。`source("<path>")` → `root = { base: <sourceBase または base>, pattern: <path> }`。パスは引用符必須 (無ければエラー)。
-
-### 4.3 `@theme [options] { … }`
-
-- params は空白区切りのオプション: `reference`、`inline`、`default`、`static`、`prefix(<ident>)`。
-- `prefix` は `/^[a-z]+$/` を満たさなければエラー。`theme.prefix` に設定する。
-- `Context { reference }` の中にある `@theme` は自動的に `reference` 扱い。
-- 子は **カスタムプロパティ宣言 (`--` で始まる) と `@keyframes` とコメント** のみ許可。それ以外はエラー。
-- 宣言は `theme.add(property, value, options)` (§6.2) で登録。`@keyframes` は `theme.addKeyframes()` に保持。
-- 最初の `@theme` は `:root, :host {}` に置き換え (中身は後で埋める)、2 つ目以降は削除する。
-
-### 4.4 `@source`
-
-```
-@source "<glob>";                 走査対象を追加
-@source not "<glob>";             走査対象から除外
-@source inline("<pattern>");      候補を直接追加 (ブレース展開あり)
-@source not inline("<pattern>");  候補を明示的に無効化
-```
-
-- ボディがあればエラー。ネストされていればエラー。パスは引用符必須。
-- 通常形は `sources.push({ base: <Context の base>, pattern, negated })`。
-- `inline(…)` は引用符内を空白で分割し、各要素をブレース展開 (§4.4.1) して候補リストに加える。`not` つきは `invalidCandidates` に入る。
-
-#### 4.4.1 ブレース展開
-
-`{a,b,c}` は列挙、`{1..5}` / `{10..0}` / `{0..20..5}` は数値範囲 (負数可、step 可、step 0 はエラー)。ネスト可。括弧が釣り合わなければエラー。
-例: `bg-{red,blue}-{100..300..100}` → `bg-red-100 bg-red-200 bg-red-300 bg-blue-100 …`。
-
-### 4.5 `@custom-variant`
-
-2 形式ある。どちらもトップレベル限定 (ネストはエラー)。名前は `/^@?[a-z0-9][a-zA-Z0-9_-]*(?<![_-])$/` を満たすこと。
-
-**(a) セレクタ短縮形** `@custom-variant <name> (<sel>[, <sel>...]);`
-
-- 括弧内をカンマで分割 (括弧・引用符を考慮した分割 §14.1)。空要素があればエラー。
-- `@` で始まる要素は at-rule、それ以外はスタイルルールのセレクタ。
-- 適用時: スタイルセレクタ群を `, ` で結合した 1 つの `StyleRule` と、at-rule ごとの `AtRule` を生成し、それぞれの子に元のノードを入れる (§8.3 の static バリアントと同じ)。
-- 複合可能性 (`compounds`) は `compoundsForSelectors` (§7.4) で決める。
-
-**(b) ボディ形式** `@custom-variant <name> { … @slot; … }`
-
-- ボディ内の `@slot;` の位置にユーティリティの宣言が挿入される。
-- ボディ内で `@variant <other>` を使える。依存関係をトポロジカルソートして登録順を決める (循環はエラー)。
-- ボディ内の `@keyframes` / `@property` は `AtRoot` で包む (ルートへ巻き上げ)。
-
-セレクタと ボディの両方があればエラー。どちらも無ければエラー。
-
-`@custom-variant` の登録は **まず名前だけを CSS 中の出現順で予約** し (順序を確定するため)、その後トポロジカル順に実体を登録する。
-
-**互換**: トップレベルの `@variant <name> (…);` (ボディなし) と、`@slot` を含む `@variant <name> { … }` は `@custom-variant` として扱う。
-
-### 4.6 `@utility`
-
-```
-@utility <name> { <宣言 / ネストルール> }        静的ユーティリティ
-@utility <name>-* { … --value(…) --modifier(…) … }  関数的ユーティリティ
-```
-
-- トップレベル限定。ボディが空ならエラー。
-- 名前 (`\/` などのエスケープは解除) の妥当性: §7.6。無効ならエラー (末尾が `*` だが `-*` でない、`*` が途中にある、などメッセージを分ける)。
-- 静的: 候補 `<name>` に対してボディをそのまま (クローンして) 返す。
-- 関数的: §7.7 の規則で `--value(…)` / `--modifier(…)` を解決する。
-- ボディ内の `@apply` は §4.9 で先に展開される (`@utility` 同士の依存はトポロジカルソート、循環はエラー)。
-- 処理後、`@utility` ノードは削除する。
-
-### 4.7 `@variant` (ネスト利用)
-
-スタイルルールの中で使う `@variant <v1>[:<v2>...][, <v3>...] { … }`。
-
-- カンマ区切りは OR (それぞれ別ルールを生成)。コロン区切りは重ね掛け (右から左へ適用)。
-- 各バリアントを `parseVariant` し、`&` ルールに順に `applyVariant` (§8.3) する。未知のバリアント、空のバリアント、適用不能ならエラー。
-- 結果のセレクタが `&` のままなら子だけを展開する。
-
-`@custom-variant` のボディ内でも同じ処理を行う。
-
-### 4.8 `@media` 内の `@tailwind utilities` / `@theme`
-
-§4.1 の表を参照。
-
-### 4.9 `@apply`
-
-`@apply <candidate> [<candidate>...];` をルールの内側で使う。
-
-- トップレベルの `@apply` は無視する。`@keyframes` 内はエラー。ボディがあればエラー。
-- 引数が全て `--` で始まる (CSS mixin 構文) ならそのまま残す。`--` 始まりと通常の候補が混在していればエラー。
-- 各候補を `compileCandidates` (`respectImportant: false`、つまり `@import … important` の影響を受けない。候補自身の `!` は有効) でコンパイルし、生成された各ルールの **子** (セレクタは捨てる) を `@apply` の位置に展開する。バリアントつき候補 (`hover:underline`) の場合は `&:hover { … }` のようなネストとして展開される。
-- 無効な候補はエラー。エラーメッセージは状況で分ける: プレフィックス未指定、`@source not inline` で無効化済み、バリアントが存在しない、テーマが空 (`@import "tailwindcss"` 忘れ)、その他。
-- `@utility` 内の `@apply` は他の `@utility` を参照できる。依存グラフをトポロジカルソートして順に展開する (循環はエラー)。
-
-### 4.10 テーマ関数
-
-宣言の値と、`@media` / `@custom-media` / `@container` / `@supports` の params の中で以下の関数を置換する。引数はカンマで分割 (括弧考慮) してトリムする。
-
-| 関数 | 挙動 |
-| --- | --- |
-| `--spacing(<n>)` | `--spacing` テーマ値 (`m`) を使い `calc(m * n)`。`n` が `0` なら `0px`、`1` なら `m`。引数が無い / 複数、`--spacing` 未定義はエラー |
-| `--alpha(<color> / <alpha>)` | `withAlpha(color, alpha)` (§7.3)。`/` で分割できなければエラー、引数が複数ならエラー |
-| `--theme(<key>[, <fallback>...][ inline])` | `key` は `--` 始まり必須。`resolveThemeValue(key, inline)` (§6.3)。at-rule の params 内では常に inline。値が無ければ fallback、fallback も無ければエラー。fallback が `initial` なら解決値。解決値が `initial` なら fallback。解決値が `var(…)` / `theme(…)` / `--theme(…)` で始まるなら、その最内の fallback が無い / `initial` の場合に fallback を注入する |
-| `theme(<key>[, <fallback>...])` | レガシー。`key` は引用符を外す。`resolveThemeValue(key)` (inline 固定)。無ければ fallback、それも無ければエラー。本仕様では `--` 始まりのキーのみサポート (ドット記法は互換レイヤーの担当) |
-
-生成されたユーティリティの宣言値 (任意値に `theme(…)` を書いた場合など) にも同じ置換を行う。置換に失敗した候補は無効扱い (エラーにしない)。
-
----
-
-## 5. デザインシステム
-
-```
-DesignSystem {
-  theme: Theme
-  utilities: Utilities         // root -> Utility[] (kind: 'static' | 'functional', compileFn, options?)
-  variants: Variants           // name -> { kind, order, applyFn, compounds, compoundsWith }
-  invalidCandidates: Set<string>
-  important: boolean
-
-  parseCandidate(raw): Candidate[]        // メモ化
-  parseVariant(raw): Variant | null       // メモ化 (同じ文字列は同じオブジェクト。順序計算で同一性を使う)
-  compileAstNodes(candidate, flags)       // メモ化。テーマ関数置換と @variant 展開も行う。失敗したら []
-  getVariantOrder(): Map<Variant, number> // §8.4
-  resolveThemeValue(path, forceInline)    // §6.3
-  trackUsedVariables(raw)                 // 値中の var(--x) を "使用済み" にする
-}
-```
-
----
-
-## 6. テーマ
-
-### 6.1 データ構造
-
-`Map<key, { value: string, options: ThemeOptions }>` と `@keyframes` の集合、`prefix: string | null`。
-
-`ThemeOptions` ビット: `INLINE=1`, `REFERENCE=2`, `DEFAULT=4`, `STATIC=8`, `USED=16`。
-
-### 6.2 `add(key, value, options)`
-
-1. `key` が `-*` で終わる場合、`value` は `initial` でなければエラー。`--*` なら全消去、それ以外は `key` から `-*` を除いた名前空間を消去 (§6.2.1)。
-2. `options` に `DEFAULT` があり、既存の値が `DEFAULT` でなければ何もしない (ユーザー定義がデフォルトに勝つ。順序に依らない)。
-3. `value === 'initial'` ならキーを削除、そうでなければ登録 (上書き)。
-
-#### 6.2.1 名前空間の消去 (`clearNamespace`)
-
-`namespace` で始まる全キーを削除する。ただし「無視すべきキー表」に該当するものは残す。
-
-| 名前空間 | 無視するキー (これらとその `-` 接尾辞) |
-| --- | --- |
-| `--font` | `--font-weight`, `--font-size` |
-| `--inset` | `--inset-shadow`, `--inset-ring` |
-| `--text` | `--text-color`, `--text-decoration-color`, `--text-decoration-thickness`, `--text-indent`, `--text-shadow`, `--text-underline-offset` |
-| `--grid-column` | `--grid-column-start`, `--grid-column-end` |
-| `--grid-row` | `--grid-row-start`, `--grid-row-end` |
-
-この表は `resolve` / `keysInNamespaces` でも使う (例: `--text` 名前空間で `--text-shadow-sm` を `text-shadow-sm` として解決しない)。
-
-### 6.3 解決
-
-`resolveKey(candidateValue, namespaces)`:
-名前空間を順に試し、`candidateValue` が null なら `namespace` そのもの、そうでなければ `${namespace}-${candidateValue}` が存在するキーを返す。存在しない場合、`candidateValue` に `.` が含まれていれば `.` を `_` に置換したキーも試す。無視キー表に該当すれば飛ばす。
-
-`resolve(candidateValue, namespaces, options)`:
-キーが見つかれば、`INLINE` (引数か登録時) なら生の値、そうでなければ `var(<escape(prefixKey(key))>)`。`REFERENCE` のキーは `var(<key>, <生の値>)` (参照モードでは変数が出力されないため)。
-
-`resolveValue(...)`: 常に生の値。
-
-`resolveWith(candidateValue, namespaces, nestedKeys)`: キー `k` を解決し、加えて `k + nestedKey` (例: `--text-lg` + `--line-height` = `--text-lg--line-height`) を同じ規則で解決して `{ nestedKey: value }` として返す。
-
-`get(keys)`: キー列を順に見て最初に存在する生の値。
-
-`namespace(ns)`: `ns` そのもの (キー null)、`ns-...` (接頭辞を除いたキー)、`ns--...` (`--` 付きの副キー) を列挙。
-
-`resolveThemeValue(path, forceInline = true)`: `path` の最後の `/` 以降を modifier として切り出し、`resolve(null, [path], INLINE if forceInline)` の結果に `withAlpha` を適用する。
-
-`prefixKey(--color-red-500)` は prefix が `tw` のとき `--tw-color-red-500`。
-
-### 6.4 モード
-
-| オプション | 効果 |
-| --- | --- |
-| `inline` | 利用側に `var()` ではなく生の値を埋め込む。変数自体は出力される |
-| `reference` | 変数を出力しない。利用側は `var(--x, <値>)` |
-| `default` | ユーザー定義があればそちらを優先 (同梱 `theme.css` が使う) |
-| `static` | 未使用でも変数を出力する (§6.6 の削除対象外) |
-
-### 6.5 出力
-
-最初の `@theme` の位置の `:root, :host { … }` に、`REFERENCE` でない全テーマ変数を登録順に `escape(prefixKey(key)): value` として出力する。`@keyframes` は `Context { theme: true } > AtRoot` としてドキュメント末尾へ。`--default-*` など値が `initial` に解決したものは出力しない。
-
-### 6.6 未使用テーマ変数・キーフレームの削除 (`optimizeAst` 内)
-
-- `@theme` 由来の宣言 (`Context { theme: true }` の中の `--` 宣言) について、`STATIC` でも `USED` でもなく、それに依存する変数 (テーマ内で `var(--x)` を参照している別の変数) も使われていなければ削除する。
-- `USED` は、生成された CSS (ユーティリティ、ユーザー CSS の宣言値) に `var(--x)` が出現したとき、あるいは `--x` という候補文字列が走査結果に含まれたとき (`build` の `--` 候補) に付く。
-- `:root, :host` が空になったら削除し、その上の空になった `@layer` も削除する。
-- テーマ内で定義した `@keyframes` は、`animation` 宣言、または使用済みの `--animate-*` 変数の値に名前が現れなければ削除する。
-
----
-
-## 7. 候補 (candidate) の文法
-
-### 7.1 データ型
-
-```
-Candidate =
-  | { kind: 'static',     root, variants: Variant[], important, raw }
-  | { kind: 'functional', root, value: Value | null, modifier: Modifier | null, variants, important, raw }
-  | { kind: 'arbitrary',  property, value: string, modifier, variants, important, raw }
-
-Value    = { kind: 'named', value, fraction: string | null } | { kind: 'arbitrary', dataType: string | null, value }
-Modifier = { kind: 'named', value } | { kind: 'arbitrary', value }
-
-Variant =
-  | { kind: 'static',     root }
-  | { kind: 'functional', root, value: { kind:'named'|'arbitrary', value } | null, modifier }
-  | { kind: 'compound',   root, modifier, variant: Variant }
-  | { kind: 'arbitrary',  selector, relative: boolean }
-```
-
-### 7.2 `parseCandidate(input)` — 0 個以上の候補解釈を返す
-
-1. `segment(input, ':')` (§14.1) で分割。最後の要素が本体、それ以前がバリアント。
-2. **プレフィックス**: `theme.prefix` があるとき、要素が 1 つだけ、または先頭要素がプレフィックスと一致しなければ無効。一致した先頭要素を除去。
-3. バリアントを **右から左** に `parseVariant`。1 つでも null なら無効。結果の配列は右端のバリアントが先頭 (適用順)。
-4. **important**: 本体末尾が `!` なら除去して `important = true`。そうでなく先頭が `!` (旧構文) でも同様。
-5. **静的一致**: `utilities.has(base, 'static')` かつ `base` に `[` が無ければ `static` 候補を出力する (以降も続行)。
-6. `segment(base, '/')` が 3 要素以上なら無効。1 要素目を本体、2 要素目があれば modifier 文字列。
-7. modifier のパース (§7.2.1)。modifier 文字列があるのに null なら無効。
-8. **任意プロパティ** (本体が `[` 始まり): `]` 終わり必須。2 文字目は `a-z` か `-`。`[` `]` を外し、最初の `:` で property / value に分割 (`:` が無い、先頭、末尾なら無効)。value は `decodeArbitraryValue` (§7.2.2) し、`isValidArbitrary` (§14.3) を満たさなければ無効。`arbitrary` 候補を出力して終了。
-9. **任意値** (本体が `]` 終わり): 最初の `-[` の前をルートとし、`utilities.has(root, 'functional')` でなければ無効。ルート候補は `[root, "[...]"]` の 1 つ。
-10. **変数省略形** (本体が `)` 終わり): 最初の `-(` の前をルート (functional 必須)。括弧内を `segment(':')` し、2 要素なら 1 つ目をデータ型。値は `--` 始まり必須、`isValidArbitrary` 必須。値を `[var(--x)]` または `[type:var(--x)]` に書き換えて 9 と同じ扱い。
-11. それ以外: `findRoots(base, root => utilities.has(root, 'functional'))` (§7.2.3)。
-12. 各 `[root, value]` について `functional` 候補を作る。`value === null` なら値なしで出力。
-    - `value` に `[` が含まれる場合: `]` 終わり必須 (違えば全体無効)。中身を decode し、`isValidArbitrary` を満たさなければこの解釈を飛ばす。先頭から `[a-z-]+` を読んで直後が `:` なら型ヒント。空 (空白のみ) や型ヒントが空文字なら飛ばす。`{ kind:'arbitrary', dataType, value }`。
-    - それ以外: `fraction` = modifier 文字列があり、かつ modifier が named なら `${value}/${modifier}`、さもなくば null。`value` が `/^[a-zA-Z0-9_.%-]+$/` を満たさなければ飛ばす。`{ kind:'named', value, fraction }`。
-
-#### 7.2.1 modifier のパース
-
-- `[x]`: decode + `isValidArbitrary` + 非空 → arbitrary。
-- `(--x)`: `--` 始まり必須、`isValidArbitrary` → arbitrary、値は `var(--x)`。
-- それ以外: `/^[a-zA-Z0-9_.%-]+$/` → named。満たさなければ null。
-
-#### 7.2.2 `decodeArbitraryValue`
-
-- `(` を含まない場合: `\_` → `_`、それ以外の `_` → 空白。
-- 含む場合: 値パーサで関数呼び出し木にし、`url(…)` (と `*_url`) の中身は変換しない。`var(…)` / `theme(…)` の第 1 引数は `_` を保持 (エスケープ解除のみ)。その他は再帰的に `_` → 空白。最後に `calc()` 系関数内の演算子 `+ - * /` の前後に空白を入れる (`calc(1px+2px)` → `calc(1px + 2px)`。`-` は前後が数値/`)`/`(`の場合のみ演算子と見なす。実装は `utils/math-operators.ts`)。
-
-#### 7.2.3 `findRoots(input, exists)`
-
-1. `exists(input)` なら `[input, null]` を出力。
-2. 最後の `-` から左へ順に切り詰め、`exists(prefix)` なら `[prefix, rest]` を出力。`rest` が空なら打ち切り。`prefix` が `@` で `@` が存在し、区切りが `-` の場合も打ち切り (`@-2xl` 対策)。
-3. 入力が `@` 始まりで `exists('@')` なら最後に `['@', input.slice(1)]` を出力。
-
-複数の解釈が返るので (例: `border-t-2` は `border-t`+`2` と `border`+`t-2`)、コンパイル時に CSS を生成できたものを採用する。
-
-### 7.3 色と不透明度
-
-`withAlpha(color, alpha)`: `alpha` が数値なら `alpha*100 + '%'` に変換。`100%` なら `color` のまま。それ以外は `color-mix(in oklab, <color> <alpha>, transparent)`。
-
-`asColor(value, modifier, theme)`: modifier なしなら `value`。arbitrary modifier なら `withAlpha(value, modifier.value)`。named なら `--opacity` 名前空間で解決した値、無ければ modifier が 0.25 の倍数の数値 (§14.4) のとき `${modifier}%`、それ以外は null (無効)。
-
-`resolveThemeColor(candidate, namespaces)`: `inherit` → `inherit`、`transparent` → `transparent`、`current` → `currentcolor`、それ以外は `theme.resolve(value, namespaces)`。結果に `asColor` を適用。
-
-### 7.4 印字 (`printCandidate`)
-
-`raw` をそのまま使う。選択子は `.${escape(raw)}` (§14.2 の CSS.escape 相当)。例: `.md\:hover\:bg-red-500\/50`。
-
-### 7.5 組み込みユーティリティの定義パターン
-
-参照実装は 4 つのヘルパーでほぼ全ユーティリティを定義している。移植版も同じ構造にすること。
-
-**`staticUtility(name, declarations)`**: 候補 `name` → 宣言の配列 (または `AtRoot` を返す関数)。
-
-**`functionalUtility(root, desc)`**:
-
-```
-desc = {
-  supportsNegative?      // true なら `-root` も登録 (値を calc(v * -1) にする)
-  supportsFractions?     // `w-1/2` のような分数を calc(1 / 2 * 100%) にする
-  themeKeys?             // 名前つき値を解決する名前空間の優先順リスト
-  defaultValue?          // 値なし候補 (例 `rounded`) の値。undefined なら themeKeys の名前空間そのもの (`--radius`) を使う
-  staticValues?          // 値 → 宣言配列 の表 (例 `auto`, `full`)。負値・modifier つきでは使わない
-  handleBareValue?(v)    // テーマに無い名前つき値の処理 (例 `z-10` → '10')。null で不可
-  handleNegativeBareValue?(v)
-  handle(value, dataType) // 最終値 → 宣言配列
-}
-```
-
-値の決定順 (候補が functional のとき):
-
-1. 値なし: modifier があれば無効。`defaultValue` または `theme.resolve(null, themeKeys)`。
-2. 任意値: modifier があれば無効。値と型ヒントをそのまま `handle` へ。
-3. 名前つき値: `theme.resolve(fraction ?? value, themeKeys)`。
-   - 解決でき、modifier があり、fraction を消費していなければ無効 (`w-4/foo`)。
-   - 未解決で `supportsFractions` かつ fraction あり: 分子分母が非負整数なら `calc(a / b * 100%)`。
-   - 未解決で負値かつ `handleNegativeBareValue` あり: その結果 (`/` を含まない値で modifier があれば無効)。結果を `handle` へ (負号を二重にしない)。
-   - 未解決で `handleBareValue` あり: その結果 (`/` を含まない値で modifier があれば無効)。
-   - 未解決で非負・modifier なし・`staticValues` に該当: その宣言 (クローン)。
-4. 値が null なら無効。負値なら `calc(<value> * -1)` にして `handle`。
-
-**`colorUtility(root, { themeKeys, handle })`**: 値必須。任意値なら `asColor(value, modifier)`、名前つきなら `resolveThemeColor`。null なら無効。
-
-**`spacingUtility(name, themeKeys, handle, { supportsNegative, supportsFractions, staticValues })`**:
-`name-px` (値 `1px`) と、`supportsNegative` なら `-name-px` (`-1px`) を静的登録。加えて `functionalUtility(name, …)` を `defaultValue: null`、`handleBareValue: v が 0.25 の倍数 → "--spacing(v)"`、`handleNegativeBareValue: → "--spacing(-v)"` で登録。`--spacing` テーマ値が無ければ bare value は不可。`--spacing(v)` はその後 §4.10 で `calc(var(--spacing) * v)` に置換される。
-
-**カスタム関数** (`utilities.functional(root, fn)`): `bg`、`text`、`border`、`font` などは値の型を推論して複数のプロパティに振り分ける (§7.8)。
-
-`compileFn` の戻り値: `AstNode[]` = 成功、`undefined` = この定義では扱えない (次の定義へ)、`null` = 無効 (options.types があれば以降も打ち切り)。
-
-### 7.6 `@utility` の名前規則
-
-- 静的名: `/^-?[a-z][a-zA-Z0-9_-]*/` にマッチする root の後ろに、`a-zA-Z0-9_-`、`.` (前後が数字)、`%` (末尾のみ、直前が数字)、`/` (1 回まで、末尾不可) のみ。root が `-` で終わり残りが空なら無効。
-- 関数的名: `-*` で終わり、残りが `/^-?[a-z][a-zA-Z0-9_-]*$/` 全体にマッチ。
-
-### 7.7 `@utility name-*` の `--value()` / `--modifier()`
-
-宣言値の中の `--value(<arg>[, <arg>...])` と `--modifier(...)` を候補の value / modifier で置換する。引数は左から順に試し、最初に解決できたものを採用する。
-
-前処理 (Prettier 対策): `\*` → `*`、`--foo --bar` → `--foo-*--bar`、空白除去、連続する `-*` を 1 つに、`--x` (括弧も `-*` も無い) → `--x-*`。
-
-| 引数 | 対象 | 解決 |
-| --- | --- | --- |
-| `'literal'` / `"literal"` | named | 候補値がリテラルと等しければその値 |
-| `--ns-*` | named | `theme.resolve(value, ['--ns'])` |
-| `--ns-*--sub` | named | `resolveWith(value, ['--ns'], ['--sub'])` の `--sub` 側 |
-| `number` / `integer` / `ratio` / `percentage` | named | 型推論に合格した値。`ratio` は `fraction` を使い `a / b` (整数のみ)、`number` は 0.25 の倍数、`percentage` は整数 % |
-| `[type]` | arbitrary | 型ヒントがあれば一致必須。無ければ推論で一致すれば値。`[*]` は何でも |
-| `--default(<v>)` | 値なし | 候補に値が無いときの既定値 |
-
-有効性の規則:
-
-- `--value(…)` が 1 つも使われていない、または 1 つも解決しなかった → 無効。
-- 解決できなかった `--value` / `--modifier` を含む宣言は削除する。
-- `--modifier` を使っていて解決せず、候補に modifier がある → 無効。
-- `ratio` で解決した場合、`--modifier` も解決していれば無効。`ratio` 解決時は ratio 以外で解決した宣言を削除する。
-- 候補に modifier があるのに `ratio` でも `--modifier` でも消費されなかった → 無効。
-- サポート外のデータ型名は警告して無視する。
-- `--spacing(--value(number))` のような入れ子も可 (§4.10 の置換が後で走る)。
-
-### 7.8 型推論 (`inferDataType(value, types)`)
-
-`types` を順に試し、最初に合致した型名を返す。`var(…)` 始まりの値は常に null。主な述語:
-
-| 型 | 条件 |
-| --- | --- |
-| `color` | 名前色、`#hex`、`rgb/rgba/hsl/hsla/oklch/oklab/lab/lch/color/color-mix/light-dark(...)`、`transparent`、`currentcolor` など |
-| `length` | 数値 + 長さ単位 (`px rem em vh vw … cqw …`)、`calc/min/max/clamp(...)`、`--spacing(...)`、`0` |
-| `percentage` | 数値 + `%`、`calc` 系 |
-| `number` | 数値 |
-| `integer` | 非負整数 |
-| `ratio` | `a/b` (数値) |
-| `url` | `url(...)` |
-| `image` | `image/image-set/cross-fade/element(...)`、`*-gradient(...)` |
-| `position` | `top/left/center...` の組み合わせ |
-| `bg-size` | `cover/contain/auto`、長さや % の 1〜2 個 |
-| `line-width` | `thin/medium/thick`、長さ |
-| `absolute-size` / `relative-size` | `xx-small` 等 / `larger`/`smaller` |
-| `family-name` / `generic-name` | フォント名 / `serif` 等 |
-| `angle`, `vector` | `deg/rad/grad/turn` / `n n n` |
-
-正確な正規表現は `src/utils/infer-data-type.ts` を参照。
-
-### 7.9 必須ユーティリティセット
-
-参照実装は静的約 490 / 関数的約 110 を持つ。移植版が最低限備えるべきセットを以下に示す (これ以外は `src/utilities.ts` を参照して同じパターンで追加できる)。`--tw-*` 変数を使う合成型ユーティリティ (transform、filter、shadow、ring、gradient、mask) は「追加」扱いとする。
-
-**レイアウト (静的)**
-`block inline-block inline flex inline-flex grid inline-grid hidden contents flow-root table table-* list-item`、`static fixed absolute relative sticky`、`visible invisible collapse`、`isolate isolation-auto`、`box-border box-content`、`overflow-{auto,hidden,clip,visible,scroll} overflow-{x,y}-*`、`float-{left,right,start,end,none} clear-*`、`sr-only not-sr-only`、`container-type 系 (@container)`。
-
-**位置 / z / order (spacing 型または bare 整数)**
-`inset inset-x inset-y inset-s inset-e top right bottom left` → `spacingUtility(name, ['--inset','--spacing'])` (負値・分数可) + `-auto` / `-full` / `--full`。`z` (bare 非負整数、`z-auto`、負値可、`--z-index`)。`order` (bare 非負整数、負値可、`--order`; `order-first`=`-9999`、`order-last`=`9999`)。
-
-**Flex / Grid**
-`flex-row flex-row-reverse flex-col flex-col-reverse flex-wrap flex-nowrap flex-wrap-reverse`、`flex-auto(auto) flex-initial(0 auto) flex-none`、`flex-<n>` (bare 非負整数 → `flex: <n>`)、`flex-<a>/<b>` (`calc(a/b * 100%)`)、`flex-[…]`、`grow[-n] shrink[-n]`、`basis-*` (spacing/container/分数)、`grid-cols-<n>` (`repeat(n, minmax(0, 1fr))`)、`grid-rows-<n>`、`col-span-<n>` (`span n / span n`)、`col-start/end-<n>`、`row-*`、`grid-flow-*`、`auto-cols/rows-*`、`gap gap-x gap-y` (`spacingUtility`, `--gap`)、`justify-* items-* content-* self-* justify-items-* justify-self-* place-*` (静的)、`space-x/y-<n>` (追加扱い)。
-
-**スペーシング**
-`p px py ps pe pt pr pb pl` → `padding*` (`--padding`,`--spacing`)。`m mx my ms me mt mr mb ml` → `margin*` (負値可) + `m*-auto`。
-
-**サイズ**
-`w min-w max-w` (`--width|--min-width|--max-width`, `--spacing`, `--container`; 分数可) + 静的 `w-auto w-full w-screen w-svw w-lvw w-dvw w-min w-max w-fit`、`h min-h max-h` 同様 (`--height`, `vh` 系)、`size-*` (width + height、`--tw-sort: size`)。
-
-**タイポグラフィ**
-`font-<family>` (`--font-*`, 副キー `--font-feature-settings` / `--font-variation-settings`) と `font-<weight>` (`--font-weight-*`; `--tw-font-weight` 変数 + `@property`)、`text-<size>` (`--text-*` + `--line-height` 副キー → `line-height: var(--tw-leading, var(--text-lg--line-height))`; modifier `/<leading>` で行間指定)、`text-<color>` (`--text-color`,`--color`)、`text-left/center/right/justify/start/end`、`leading-*` (`--leading`,`--spacing`; `--tw-leading`)、`tracking-*` (`--tracking`; 負値可)、`uppercase lowercase capitalize normal-case`、`italic not-italic`、`underline overline line-through no-underline`、`truncate text-ellipsis text-clip`、`whitespace-*`、`break-*`、`list-*`、`antialiased subpixel-antialiased`、`decoration-*`、`underline-offset-*`。
-
-**背景 / ボーダー**
-`bg-<color>` (`--background-color`,`--color`)、`bg-<image>` (`--background-image`)、任意値は型推論で `background-position` / `background-size` / `background-image` / `background-color` に振り分け、`bg-{auto,cover,contain} bg-{fixed,local,scroll} bg-{top,center,...} bg-{repeat,no-repeat,...} bg-none bg-clip-* bg-origin-*`。
-`border[-{x,y,s,e,t,r,b,l}]` (値なし → `--default-border-width` か `1px`; 整数 → `<n>px`; 色 → `border-color`; `--tw-border-style` 変数と `border-style: var(--tw-border-style)` を伴う)、`border-{solid,dashed,dotted,double,hidden,none}`、`rounded[-{s,e,t,r,b,l,ss,se,ee,es,tl,tr,br,bl}]` (`--radius`; `rounded-none`=0、`rounded-full`=`calc(infinity * 1px)`)、`outline-*` (追加扱い)。
-
-**効果 / その他**
-`opacity-<n>` (`--opacity`; bare 0.25 刻み → `n%`)、`shadow-*` / `ring-*` / `blur-*` / `transform` 系 (追加扱い)、`transition[-*]` (`transition-property` + `--default-transition-timing-function` / `--default-transition-duration`)、`duration-<n>` (`n ms`)、`delay-<n>`、`ease-*` (`--ease`)、`animate-*` (`--animate`)、`cursor-*`、`select-*`、`pointer-events-*`、`resize*`、`appearance-*`、`scroll-*`、`will-change-*`、`content-[…]`、`aspect-*` (`--aspect`, `ratio`)、`columns-*`、`object-*`、`accent-* caret-* fill-* stroke-*` (color)。
-
-各ユーティリティの正確なプロパティと順序は `src/utilities.ts` を正とする。
-
----
-
-## 8. バリアント
-
-### 8.1 レジストリ
-
-```
-Variants {
-  variants: Map<name, { kind: 'static'|'functional'|'compound', order: number, applyFn,
-                        compounds: Compounds, compoundsWith: Compounds }>
-  compareFns: Map<order, (a, z) => number>   // グループ内比較関数
-}
-Compounds = Never(0) | AtRules(1) | StyleRules(2)   // ビット集合
-```
-
-- `order` は登録順に 1 ずつ増える。`group(fn, compareFn)` で登録した複数のバリアントは同じ `order` を共有し、グループ内の順序は `compareFn` で決める。
-- 既存名を再登録すると `kind` / `applyFn` / `compounds` だけ更新され `order` は保たれる (`@custom-variant` の予約 → 実体登録に使う)。
-- `compounds`: このバリアントが生成するルールの種類。`compoundsWith`: 複合バリアントが子として受け入れる種類。
-- `compoundsWith(parent, child)`: parent が compound であり、child.compounds ≠ Never、parent.compoundsWith ≠ Never、両者のビット積 ≠ 0 のとき true。child が arbitrary の場合は `compoundsForSelectors([selector])` で計算。
-
-`compoundsForSelectors(selectors)`: `@` 始まりのセレクタが `@media` / `@supports` / `@container` 以外なら Never。`::` を含めば Never。それ以外は at-rule → AtRules、スタイル → StyleRules をビット OR。
-
-### 8.2 `parseVariant(raw)`
-
-1. `[...]` 形式 (任意バリアント): `[@media…&…]` (at-rule と `&` の混在) は無効。中身を decode、`isValidArbitrary`、非空。`>` `+` `~` 始まりなら `relative = true`。relative でなく `@` 始まりでもなく `&` を含まなければ `&:is(<sel>)` に包む。
-2. `segment(raw, '/')` が 3 要素以上なら無効。`[name, modifier]`。
-3. `findRoots(name, variants.has)` の各解釈について kind で分岐:
-   - **static**: 値や modifier があれば無効。
-   - **functional**: modifier をパース (文字列があるのに null なら無効)。値なし → `value: null`。`[x]` → arbitrary (decode/valid/非空)。`(--x)` → `var(--x)`。それ以外は `/^[a-zA-Z0-9_.%-]+$/` を満たす named (満たさなければ次の解釈へ)。`x-[…]` のように `[` で始まらないのに `]` で終わる値は次の解釈へ。
-   - **compound**: 値必須。`not` / `has` / `in` は modifier を子に転送 (`not-group-hover/name`)。子を `parseVariant` (null なら無効)。`compoundsWith(root, child)` でなければ無効。
-
-### 8.3 `applyVariant(node, variant)` — ルールノードを破壊的に書き換える
-
-- **arbitrary**: depth 0 で relative なら無効。`node.nodes = [rule(selector, node.nodes)]`。
-- **static / functional**: `applyFn(node, variant)`。null を返せば無効。
-- **compound**: 空の `@slot` at-rule を作り、子バリアントを適用 (depth+1)。`not` の場合、結果の子が 2 つ以上なら無効。各子 (rule / at-rule 以外があれば無効) に `applyFn` を適用。最後に、空の rule / at-rule の `nodes` を元の `node.nodes` で埋め、`node.nodes` を結果で置き換える。
-
-静的バリアントの標準実装 `staticVariant(name, selectors)`: `r.nodes = selectors.map(sel => rule(sel, r.nodes))`。
-
-### 8.4 順序づけ (`getVariantOrder`)
-
-パース済みの全バリアント (メモ化により同一文字列は同一オブジェクト) を `variants.compare` でソートし、比較結果が等しい隣接要素に同じインデックスを振る。候補のソートキーは `Σ 1 << index` (BigInt)。
+Only one `!` is allowed; the trailing form is canonical and the leading form is accepted for
+compatibility. A leading `-` on the root selects the negative form of a utility that supports it
+(for example `-mt-2`).
+
+### 8.2 `parseCandidate(input)` Algorithm
+
+The function yields zero or more `Candidate` interpretations. Any step that says "invalid" ends the
+function without further output; "skip" abandons only the current interpretation.
+
+1. `rawVariants = segment(input, ":")`. The last element is the base; the rest are variants.
+2. If the theme has a prefix: with a single element the candidate is invalid; if the first element
+   is not the prefix the candidate is invalid; otherwise drop the first element.
+3. Parse the variants from right to left with `parseVariant`. Any null result makes the candidate
+   invalid. The resulting list is in application order.
+4. If the base ends in `!`, remove it and set `important`. Otherwise, if it starts with `!`, remove
+   it and set `important`.
+5. If a static utility named `base` exists and `base` contains no `[`, yield a `static` candidate.
+   Continue.
+6. `parts = segment(base, "/")`. Three or more parts is invalid. The first part is the base without
+   modifier; the second, when present, is the modifier text.
+7. Parse the modifier (Section 8.2.1). Modifier text that parses to null is invalid.
+8. Arbitrary property (base starts with `[`): the base MUST end in `]`; the second character MUST
+   be `a`-`z` or `-`; strip the brackets; find the first `:` (absent, first, or last position is
+   invalid); `property` is the text before it; `value` is `decodeArbitraryValue` of the text after
+   it and MUST satisfy `isValidArbitrary`. Yield an `arbitrary` candidate and stop.
+9. Arbitrary value (base ends in `]`): find the first `-[`; absent is invalid. The root is the
+   text before it and MUST be a registered functional root; otherwise invalid. The single root
+   interpretation is `(root, "[...]")`.
+10. Variable shorthand (base ends in `)`): find the first `-(`; absent is invalid. The root is the
+    text before it and MUST be a registered functional root. Split the parenthesized text on `:`;
+    two parts give a data type and a value. The value MUST start with `--` and satisfy
+    `isValidArbitrary`. Rewrite the value as `[var(--x)]` or `[<type>:var(--x)]` and treat it as
+    step 9.
+11. Otherwise `roots = findRoots(base, isFunctionalRoot)` (Section 8.2.2).
+12. For each `(root, value)`: create a `functional` candidate with the parsed modifier. When
+    `value` is null, yield it as is.
+    - When `value` contains `[`: it MUST end in `]` (otherwise invalid). Decode the bracket
+      contents; skip when `isValidArbitrary` fails. Read a type hint: consume characters `a`-`z`
+      and `-` from the start; if the next character is `:`, the consumed text is the hint and the
+      rest is the value. Skip when the value is empty or whitespace, or when the hint is the empty
+      string. Set `value = { arbitrary, dataType: hint or null, value }`.
+    - Otherwise: `fraction` is `<value>/<modifier text>` when modifier text exists and the parsed
+      modifier is named, else null. Skip when `value` fails the named value pattern. Set
+      `value = { named, value, fraction }`.
+    - Yield the candidate.
+
+#### 8.2.1 Modifier Parsing
+
+- `[x]`: decode `x`; it MUST satisfy `isValidArbitrary` and be non-empty; result is arbitrary.
+- `(--x)`: the inner text MUST start with `--` and satisfy `isValidArbitrary`; result is arbitrary
+  with value `var(--x)`.
+- Otherwise the text MUST match the named value pattern; result is named. Anything else is null.
+
+#### 8.2.2 `findRoots(input, exists)`
+
+1. If `exists(input)`, yield `(input, null)`.
+2. Starting from the last `-`, repeatedly cut the input at that `-` and test the left part. When
+   it exists, the right part is the value; if the right part is empty, stop. If the left part is
+   `@`, `@` exists, and the separator is `-`, stop. Otherwise yield and move to the previous `-`.
+3. If the input starts with `@` and `@` exists, finally yield `("@", input without the @)`.
+
+Multiple interpretations MAY be yielded (`border-t-2` yields both `border-t` + `2` and `border` +
+`t-2`). The compiler emits every interpretation that produces CSS; built-in definitions are
+designed so that at most one does.
+
+### 8.3 `parseVariant(input)` Algorithm
+
+1. Arbitrary variant (`[...]`): a value starting with `@` that also contains `&` is null. Decode
+   the contents; they MUST satisfy `isValidArbitrary` and be non-empty. `relative` is true when the
+   selector starts with `>`, `+`, or `~`. When the selector is not relative, does not start with
+   `@`, and contains no `&`, wrap it as `&:is(<selector>)`.
+2. `parts = segment(input, "/")`; three or more parts is null. The first part is the name; the
+   second, if present, is the modifier text.
+3. For each `(root, value)` from `findRoots(name, variantExists)`, branch on the registered kind:
+   - `static`: any value or modifier is null. Return `{ static, root }`.
+   - `functional`: parse the modifier (text present but null result is null). A null value gives
+     `{ functional, root, value: null, modifier }`. A value ending in `]` MUST start with `[`
+     (otherwise try the next root); decode, validate, non-empty; the value is arbitrary. A value
+     ending in `)` MUST start with `(`; decode, validate, non-empty, MUST start with `--`; the
+     value is arbitrary with text `var(--x)`. Otherwise the value MUST match the named value
+     pattern (else try the next root); the value is named.
+   - `compound`: a null value is null. When the root is `not`, `has`, or `in` and a modifier
+     exists, move the modifier onto the value (`value = value + "/" + modifier`). Parse the value
+     as a variant (null is null). The pair MUST satisfy `compoundsWith(root, inner)`
+     (Section 9.1). Parse the remaining modifier. Return `{ compound, root, modifier, variant }`.
+4. Return null.
+
+## 9. Variants
+
+### 9.1 Registry Semantics
+
+- `static(name, apply, { compounds })`, `functional(name, apply, { compounds })`, and
+  `compound(name, compoundsWith, apply, { compounds })` register definitions. `compounds` defaults
+  to `STYLE_RULES`. Non-compound definitions have `compoundsWith = NEVER`.
+- Each new name receives `order = lastOrder + 1`. Inside `group(fn, compareFn)` every name
+  registered by `fn` shares one `order`, and `compareFn` is stored for that order.
+- Re-registering an existing name replaces `kind`, `apply`, and `compounds` but keeps `order`.
+- `compoundsWith(parent, child)` is true only when the parent is a compound definition, the child's
+  `compounds` is not `NEVER`, the parent's `compoundsWith` is not `NEVER`, and the bitwise AND of
+  the two is non-zero. For an arbitrary child the `compounds` value is computed with
+  `compoundsForSelectors([selector])`.
+- `compoundsForSelectors(selectors)`: return `NEVER` if any selector starts with `@` but not with
+  `@media`, `@supports`, or `@container`, or if any selector contains `::`. Otherwise OR together
+  `AT_RULES` for at-rule selectors and `STYLE_RULES` for the rest.
+
+### 9.2 Application Contract
+
+Every `apply` function receives a rule node and mutates `node.nodes` in place, wrapping the
+existing children in new rules or at-rules. Returning `null` rejects the candidate.
+
+The standard static helper `staticVariant(name, selectors)` sets `node.nodes` to one
+`rule(selector, children)` per selector and computes `compounds` with `compoundsForSelectors`.
+
+### 9.3 `applyVariant(node, variant, depth = 0)`
+
+- `arbitrary`: when `relative` and `depth` is 0, reject. Otherwise
+  `node.nodes = [rule(selector, node.nodes)]`.
+- `static` and `functional`: call the registered `apply`; propagate rejection.
+- `compound`: create an isolated at-rule `@slot` with no children and apply the inner variant to
+  it at `depth + 1` (propagate rejection). When the root is `not` and the isolated node now has
+  more than one child, reject. For each child (any child that is not a rule or at-rule rejects),
+  call the compound definition's `apply` on that child (propagate rejection). Finally walk the
+  isolated node's children and give every rule or at-rule with no children the original
+  `node.nodes`; then set `node.nodes` to the isolated node's children.
+
+### 9.4 Ordering
+
+`getVariantOrder()` sorts every parsed variant object with `compare` and assigns an index that
+increases each time `compare` reports a difference between neighbors. Equal variants share an
+index. The result MAY be cached until a new variant string is parsed.
 
 `compare(a, z)`:
-1. 同一なら 0。null は最小。
-2. arbitrary 同士はセレクタの文字列比較。arbitrary は非 arbitrary より後。
-3. `order` の差。
-4. 両方 compound なら子バリアントを再帰比較、次に modifier の文字列比較 (modifier なしが先)。
-5. `order` にグループ比較関数があればそれ。
-6. root の文字列比較。
-7. functional の値: null が先、arbitrary は named より後、値の文字列比較。
 
-### 8.5 組み込みバリアント (登録順)
+1. Identical objects compare equal. Null sorts first.
+2. Two arbitrary variants compare by selector text. An arbitrary variant sorts after any other
+   kind.
+3. Compare registered `order`.
+4. When both are compound: compare the inner variants recursively, then compare modifiers by text
+   (a missing modifier sorts first).
+5. When a group comparison function exists for the order, use it.
+6. Compare roots by text.
+7. Functional values: a null value sorts first; an arbitrary value sorts after a named value;
+   otherwise compare value text.
 
-登録順がそのまま出力順になるので、この順序を守ること。
+### 9.5 Built-in Variants
 
-| 名前 | 生成 | compounds |
-| --- | --- | --- |
-| `*` | `:is(& > *)` | Never |
-| `**` | `:is(& *)` | Never |
-| `not-<v>` (compound, compoundsWith = StyleRules\|AtRules) | 子のセレクタ `&:hover` を `&:not(:hover)` に、`@media (q)` を `@media not all and (q)` に、`@supports (q)` を `@supports not (q)` に、`@container (q)` を `@container not (q)` に否定する。子が複数ルールを生成する場合 (例 `hover` はセレクタ + `@media`) は、それぞれ独立に否定した 2 ルールになる。詳細は `variants.ts` の `negateConditions` | StyleRules |
-| `group-<v>[/name]` (compound, StyleRules) | 子の各ルールの `&` を `:where(.group)` (名前つきは `:where(.group\/name)`、プレフィックス時は `.tw\:group`) に置換し、複数なら `:is(...)` に包み、`&:is(<sel> *)` にする。ネストしたスタイルルールがあれば無効 | StyleRules |
-| `peer-<v>[/name]` | 同上だが `&:is(:where(.peer) ~ *)` | StyleRules |
-| `first-letter` / `first-line` | `&::first-letter` / `&::first-line` | Never |
-| `marker` | `& *::marker`, `&::marker`, `& *::-webkit-details-marker`, `&::-webkit-details-marker` | Never |
-| `selection` | `& *::selection`, `&::selection` | Never |
-| `file` | `&::file-selector-button` | Never |
-| `placeholder` | `&::placeholder` | Never |
-| `backdrop` | `&::backdrop` | Never |
-| `details-content` | `&::details-content` | Never |
-| `before` / `after` | `&::before { @property --tw-content (syntax "*", initial-value "", inherits false) を AtRoot; content: var(--tw-content); ... }` | Never |
-| `first last only odd even first-of-type last-of-type only-of-type` | `&:first-child` 等 | StyleRules |
-| `visited target` | `&:visited` `&:target` | |
-| `open` | `&:is([open], :popover-open, :open)` | |
-| `default checked indeterminate placeholder-shown autofill optional required valid invalid user-valid user-invalid in-range out-of-range read-only` | `&:<name>` | |
-| `empty focus-within` | | |
-| `hover` | `&:hover { @media (hover: hover) { … } }` | StyleRules |
-| `focus focus-visible active enabled disabled` | `&:<name>` | |
-| `inert` | `&:is([inert], [inert] *)` | |
-| `in-<v>` (compound, StyleRules) | 子ルールのセレクタの `&` を `*` に置換し `:where(<sel>) &` にする (`:where(*:hover) &`)。modifier 不可 | |
-| `has-<v>` (compound, StyleRules) | `&:has(<child-sel with & → *>)`。modifier 不可 | |
-| `aria-<v>` (functional) | named: `&[aria-<v>="true"]`、arbitrary: `&[aria-<v>]` (値は `=` の右辺を必要なら引用符で包む) | |
-| `data-<v>` (functional) | `&[data-<v>]` (同上の引用) | |
-| `nth-<n>` `nth-last-<n>` `nth-of-type-<n>` `nth-last-of-type-<n>` | `&:nth-child(n)` 等。named は非負整数のみ、arbitrary は任意 | |
-| `supports-<v>` (functional) | `@supports (<v>)`。`x` (`:` なし) は `(x: var(--tw))`、`not(...)` 等の関数形式はそのまま (`and`/`or`/`not` の前後に空白を保証) | AtRules |
-| `motion-safe motion-reduce` | `@media (prefers-reduced-motion: no-preference / reduce)` | AtRules |
-| `contrast-more contrast-less` | `@media (prefers-contrast: more / less)` | AtRules |
-| `max-<bp>` (グループ、降順) | `@media (width < <bp>)` | AtRules |
-| `<bp>` (テーマ `--breakpoint-*` ごとに静的) と `min-<bp>` (同一グループ、昇順) | `@media (width >= <bp>)` | AtRules |
-| `@max-<w>[/name]` (グループ、降順) | `@container [name] (width < <w>)` (`--container-*`) | AtRules |
-| `@<w>` と `@min-<w>` (同一グループ、昇順) | `@container [name] (width >= <w>)` | AtRules |
-| `portrait landscape` | `@media (orientation: …)` | AtRules |
-| `ltr rtl` | `&:where(:dir(ltr), [dir="ltr"], [dir="ltr"] *)` | StyleRules |
-| `dark` | `@media (prefers-color-scheme: dark)` (ユーザーは `@custom-variant dark (&:where(.dark, .dark *));` で上書きする) | AtRules |
-| `starting` | `@starting-style` | Never |
-| `print` | `@media print` | AtRules |
-| `forced-colors inverted-colors` | `@media (forced-colors: active)` / `(inverted-colors: inverted)` | AtRules |
-| `pointer-{none,coarse,fine} any-pointer-{…}` | `@media (pointer: …)` / `(any-pointer: …)` | AtRules |
-| `noscript` | `@media (scripting: none)` | AtRules |
+Registration order determines output order and MUST be preserved as listed. Each entry gives the
+name, what it wraps the utility's nodes in, and the `compounds` value when it is not the default
+`STYLE_RULES`.
 
-ブレークポイント系の値解決: static (`md`) は `--breakpoint-md` の生の値、functional (`min-[600px]`, `max-md`) は任意値または `--breakpoint-*` の生の値。`var(` を含む値は無効。グループ内比較は単位ごとにバケット分けして数値で比較 (`compareBreakpoints`)。
+- `*`: `:is(& > *)`; `NEVER`.
+- `**`: `:is(& *)`; `NEVER`.
+- `not-<v>` (compound; `compoundsWith = STYLE_RULES | AT_RULES`): negates each rule produced by the
+  inner variant. A style selector `&:hover` becomes `&:not(:hover)`; `@media (q)` becomes
+  `@media not all and (q)`; `@supports (q)` becomes `@supports not (q)`; `@container (q)` becomes
+  `@container not (q)`. When the inner variant produces several sibling rules, each is negated
+  independently (`not-hover` yields both `.x:not(:hover)` and `@media not all and (hover: hover)
+  { .x }`).
+- `group-<v>[/<name>]` (compound; `compoundsWith = STYLE_RULES`): for each rule produced by the
+  inner variant, replace `&` in its selector with `:where(.group)` (or `:where(.group\/<name>)`;
+  with a theme prefix `p`, `:where(.p\:group)`), wrap a selector list in `:is(...)`, and set the
+  selector to `&:is(<selector> *)`. Reject when the inner variant produced nested style rules or
+  a relative arbitrary selector.
+- `peer-<v>[/<name>]`: as `group` with `.peer` and `&:is(<selector> ~ *)`.
+- `first-letter`: `&::first-letter`; `NEVER`.
+- `first-line`: `&::first-line`; `NEVER`.
+- `marker`: `& *::marker`, `&::marker`, `& *::-webkit-details-marker`,
+  `&::-webkit-details-marker`; `NEVER`.
+- `selection`: `& *::selection`, `&::selection`; `NEVER`.
+- `file`: `&::file-selector-button`; `NEVER`.
+- `placeholder`: `&::placeholder`; `NEVER`.
+- `backdrop`: `&::backdrop`; `NEVER`.
+- `details-content`: `&::details-content`; `NEVER`.
+- `before` and `after`: `&::before` (or `&::after`) whose children are an `at-root` holding
+  `@property --lm-content { syntax: "*"; initial-value: ""; inherits: false; }`, then
+  `content: var(--lm-content);`, then the utility's nodes; `NEVER`.
+- `first`, `last`, `only`, `odd`, `even`, `first-of-type`, `last-of-type`, `only-of-type`:
+  `&:first-child`, `&:last-child`, `&:only-child`, `&:nth-child(odd)`, `&:nth-child(even)`,
+  `&:first-of-type`, `&:last-of-type`, `&:only-of-type`.
+- `visited`, `target`: `&:visited`, `&:target`.
+- `open`: `&:is([open], :popover-open, :open)`.
+- `default`, `checked`, `indeterminate`, `placeholder-shown`, `autofill`, `optional`, `required`,
+  `valid`, `invalid`, `user-valid`, `user-invalid`, `in-range`, `out-of-range`, `read-only`:
+  `&:<name>`.
+- `empty`, `focus-within`: `&:<name>`.
+- `hover`: `&:hover { @media (hover: hover) { ... } }`.
+- `focus`, `focus-visible`, `active`, `enabled`, `disabled`: `&:<name>`.
+- `inert`: `&:is([inert], [inert] *)`.
+- `in-<v>` (compound; `compoundsWith = STYLE_RULES`): for each rule produced by the inner variant,
+  replace `&` with `*` and set the selector to `:where(<selector>) &`. A modifier rejects.
+- `has-<v>` (compound; `compoundsWith = STYLE_RULES`): replace `&` with `*` and set the selector
+  to `&:has(<selector>)`. A modifier rejects.
+- `aria-<v>` (functional): a named value gives `&[aria-<v>="true"]`; an arbitrary value gives
+  `&[aria-<v>]` where an unquoted right-hand side after `=` is wrapped in double quotes (a trailing
+  ` i` or ` s` flag is preserved outside the quotes). A modifier rejects. The attribute selector
+  MUST parse; otherwise reject.
+- `data-<v>` (functional): `&[data-<v>]` with the same quoting rule.
+- `nth-<n>`, `nth-last-<n>`, `nth-of-type-<n>`, `nth-last-of-type-<n>` (functional):
+  `&:nth-child(n)`, `&:nth-last-child(n)`, `&:nth-of-type(n)`, `&:nth-last-of-type(n)`. A named
+  value MUST be a positive integer; an arbitrary value is used verbatim.
+- `supports-<v>` (functional; `AT_RULES`): when the value matches `^[\w-]*\s*\(` it is used as the
+  condition verbatim except that bare `and`, `or`, and `not` function names receive surrounding
+  spaces; when the value contains no `:` it becomes `(<v>: var(--lm))`; otherwise it is wrapped
+  in parentheses unless already parenthesized. Wrap in `@supports <condition>`.
+- `motion-safe`, `motion-reduce`: `@media (prefers-reduced-motion: no-preference)`,
+  `@media (prefers-reduced-motion: reduce)`; `AT_RULES`.
+- `contrast-more`, `contrast-less`: `@media (prefers-contrast: more)`,
+  `@media (prefers-contrast: less)`; `AT_RULES`.
+- Breakpoint group `max` (one group, descending comparison): `max-<bp>` wraps in
+  `@media (width < <value>)`; `AT_RULES`.
+- Breakpoint group `min` (one group, ascending comparison): one static variant per
+  `--breakpoint-*` theme key wrapping in `@media (width >= <value>)`, plus functional `min-<bp>`
+  with the same output; `AT_RULES`.
+- Container group `@max` (descending): `@max-<w>[/<name>]` wraps in
+  `@container [<name> ](width < <value>)`; `AT_RULES`.
+- Container group `@` (ascending): `@<w>[/<name>]` and `@min-<w>[/<name>]` wrap in
+  `@container [<name> ](width >= <value>)`; `AT_RULES`.
+- `portrait`, `landscape`: `@media (orientation: portrait)`, `@media (orientation: landscape)`;
+  `AT_RULES`.
+- `ltr`, `rtl`: `&:where(:dir(ltr), [dir="ltr"], [dir="ltr"] *)` and the `rtl` equivalent.
+- `dark`: `@media (prefers-color-scheme: dark)`; `AT_RULES`. Authors override it with
+  `@custom-variant dark (&:where(.dark, .dark *));`.
+- `starting`: `@starting-style`; `NEVER`.
+- `print`: `@media print`; `AT_RULES`.
+- `forced-colors`, `inverted-colors`: `@media (forced-colors: active)`,
+  `@media (inverted-colors: inverted)`; `AT_RULES`.
+- `pointer-none`, `pointer-coarse`, `pointer-fine`, `any-pointer-none`, `any-pointer-coarse`,
+  `any-pointer-fine`: `@media (pointer: ...)` and `@media (any-pointer: ...)`; `AT_RULES`.
+- `noscript`: `@media (scripting: none)`; `AT_RULES`.
 
----
+Breakpoint and container values resolve as follows: a static breakpoint name uses the raw
+`--breakpoint-<name>` value; a functional value uses the arbitrary text or the raw
+`--breakpoint-*` (or `--container-*`) value of the named key; a modifier on `min`/`max` rejects;
+a value containing `var(` rejects. Within a group, variants compare by bucketing values by unit
+(or by function name when the value is a function call) and then numerically in the group's
+direction; values that cannot be resolved sort first in ascending groups and last in descending
+groups.
 
-## 9. コンパイル (`compileCandidates`)
+## 10. Utilities
 
-### 9.1 手順
+### 10.1 Registry Semantics
 
-1. 各生候補について: `invalidCandidates` に含まれれば無効。`parseCandidate` が空なら無効。
-2. 各候補解釈について `compileAstNodes` (§9.2)。ルールが 1 つも生成されなければ無効候補として通知 (`invalidCandidates` に追加)。
-3. 生成した各ルールノードに `{ propertySort, variantOrder, candidate }` を紐づける。
-4. ソート (§9.3)。
+- `static(name, compile)` and `functional(name, compile, options)` append a definition to the list
+  for `name`.
+- `has(name, kind)` is true when at least one definition of that kind exists for `name`.
+- `get(name)` returns the list (possibly empty).
 
-### 9.2 `compileAstNodes(candidate, flags)`
+### 10.2 Definition Helpers
 
-1. `compileBaseUtility`: arbitrary 候補なら `[decl(property, asColor(value, modifier))]` (modifier は不透明度と仮定)。それ以外は `utilities.get(root)` の各定義を試す (§7.5 の戻り値規則。`options.types` に `any` を含む「フォールバック」定義は他が全て失敗した後に試す)。
-2. 各 AST について: `propertySort` を計算 (§9.3)。候補が `important` か、`designSystem.important && RespectImportant フラグ` なら全宣言 (`AtRoot` 内を除く) を `important = true`。
-3. `StyleRule { selector: '.' + escape(raw), nodes }` を作り、`candidate.variants` を順に `applyVariant`。1 つでも無効なら `[]`。
-4. デザインシステム側のメモ化層で、生成 AST にテーマ関数置換と `@variant` 展開を行う。例外が出たら `[]`。
+Implementations SHOULD define built-in utilities through these helpers so that behavior stays
+uniform.
 
-### 9.3 ソート
+`staticUtility(name, declarations)` registers a static definition returning the given
+`(property, value)` pairs as declarations, or the result of calling a supplied function (used for
+`at-root` nodes).
 
-`propertySort` = `{ order: number[], count: number }`:
-- AST を幅優先で辿り、値が定義済みの宣言を数える (`count`)。
-- 各宣言のプロパティを `GLOBAL_PROPERTY_ORDER` (`src/property-order.ts` の配列。`container-type, pointer-events, visibility, position, inset, …, forced-color-adjust`) で引き、見つかった添字を集合に入れる。`--tw-sort: <prop>` 宣言があれば、その `<prop>` の添字だけを採用して以降の宣言は見ない。
-- `order` は添字の昇順ソート。
+`functionalUtility(root, description)` registers a functional definition. The description fields
+are:
 
-比較 (`a`, `z`):
-1. `variantOrder` (BigInt) の昇順。
-2. `order` を先頭から比較し、最初に異なる添字の昇順 (無ければ ∞)。
-3. `count` の降順 (宣言が多いものが先)。
-4. 候補文字列の自然順比較 (数字列は数値として比較。`utils/compare.ts`)。
+- `supportsNegative` (boolean): also register `-<root>`; its values are wrapped as
+  `calc(<value> * -1)`.
+- `supportsFractions` (boolean): a named value with a fraction resolves to
+  `calc(<a> / <b> * 100%)` when both parts are positive integers.
+- `themeKeys` (list of namespaces) used to resolve named values and the default value.
+- `defaultValue` (string, null, or absent): the value for a candidate without a value segment.
+  When absent, resolve the first namespace itself (`theme.resolve(null, themeKeys)`).
+- `staticValues` (map from named value to node list): consulted last, only for non-negative
+  candidates without a modifier.
+- `handleBareValue(value)` and `handleNegativeBareValue(value)`: return a value string for a named
+  value that is not in the theme, or null.
+- `handle(value, dataType)`: return the declarations for a final value.
 
----
+Value resolution for a functional candidate:
 
-## 10. AST 最適化と出力 (`optimizeAst`)
+1. No value: a modifier makes the candidate invalid. Use `defaultValue` when present; otherwise
+   resolve the namespace itself.
+2. Arbitrary value: a modifier makes the candidate invalid. Pass the value and data type to
+   `handle`.
+3. Named value: `theme.resolve(fraction or value, themeKeys)`.
+   - When this resolved and a modifier exists but no fraction was consumed, the candidate is
+     invalid (`w-4/foo`).
+   - When unresolved and `supportsFractions` and a fraction exists: both parts MUST be positive
+     integers; the value is `calc(a / b * 100%)`.
+   - When unresolved, the candidate is negative, and `handleNegativeBareValue` exists: use its
+     result; a result without `/` combined with a modifier is invalid; pass the result to
+     `handle` directly (no further negation).
+   - When unresolved and `handleBareValue` exists: use its result; a result without `/` combined
+     with a modifier is invalid.
+   - When unresolved, non-negative, no modifier, and `staticValues` has the value: return a clone
+     of those nodes.
+4. A null value means no output. A negative candidate wraps the value as `calc(<value> * -1)`
+   before `handle`.
 
-生成済み AST 全体 (入力 CSS + ユーティリティ) に対して実行する。
+`colorUtility(root, { themeKeys, handle })` registers a functional definition that requires a
+value. An arbitrary value goes through `asColor(value, modifier)`; a named value goes through
+`resolveThemeColor`. A null result means no output.
 
-### 10.1 変換パス
+`spacingUtility(name, themeKeys, handle, options)` registers `<name>-px` (value `1px`),
+`-<name>-px` when negative values are supported (value `-1px`), and a `functionalUtility` with
+`defaultValue = null`, `handleBareValue` returning `--spacing(<v>)` when `v` is a multiple of
+0.25 and the `--spacing` theme value exists (null otherwise), and `handleNegativeBareValue`
+returning `--spacing(-<v>)` under the same conditions. Theme function substitution later turns
+`--spacing(4)` into `calc(var(--spacing) * 4)`.
 
-深さ優先で新しい AST を構築する。
+### 10.3 Colors and Opacity
 
-- **宣言**: `--tw-sort` と値未定義は捨てる。`Context { theme }` 内の `--` 宣言は §6.6 の追跡対象 (値 `initial` は捨てる)。値に `var(` があれば使用変数を追跡 (テーマ内の `--` 宣言は依存関係として、それ以外は使用として)。`animation` 宣言はキーフレーム名を使用済みに。
-- **ルール**: 子を変換し、空になったら捨てる。
-- **`@property`** (深さ 0): 同じ名前は 1 回だけ出力。ポリフィル有効時はフォールバック宣言を収集 (§10.4)。
-- **その他 at-rule**: 子を変換。空になった at-rule は捨てるが、`@layer` `@charset` `@custom-media` `@namespace` `@import` `@apply` は空でも残す。`@theme` 由来の `@keyframes` は削除候補として記録。
-- **`AtRoot`**: 子を深さ 0 として変換し、`atRoots` に退避 (後でドキュメント末尾へ)。
-- **`Context`**: `reference` なら子ごと捨てる。それ以外は子を同じ親に展開 (context 情報は継承)。
-- **コメント**: そのまま。
+- `withAlpha(color, alpha)`: when `alpha` parses as a number, replace it with
+  `<number * 100>%`. When the result is `100%`, return `color`. Otherwise return
+  `color-mix(in oklab, <color> <alpha>, transparent)`.
+- `asColor(value, modifier)`: no modifier returns `value`. An arbitrary modifier returns
+  `withAlpha(value, modifier.value)`. A named modifier first tries the `--opacity` namespace;
+  when absent, the modifier MUST be a multiple of 0.25 (else null) and the alpha is
+  `<modifier>%`.
+- `resolveThemeColor(candidate, themeKeys)`: the named values `inherit`, `transparent`, and
+  `current` map to `inherit`, `transparent`, and `currentcolor`; anything else resolves through
+  the theme. Apply `asColor` to the result.
 
-### 10.2 後処理
+### 10.4 Custom Property Registrations
 
-1. 未使用テーマ変数の削除 (§6.6)。
-2. 未使用 `@keyframes` の削除。
-3. `atRoots` を末尾に連結。
-4. ポリフィル (§10.4)。
-5. ネスト展開 (§10.3)。
+Utilities that compose through internal variables (for example font weight) emit an `at-root`
+node containing `@property --lm-<name> { syntax: "*"; inherits: false; [initial-value: <v>;] }`
+alongside their declarations. The optimizer prints each registration once (Section 12.1).
 
-### 10.3 ネスト展開 (`handleNesting`)
+### 10.5 Utility Name Rules for `@utility`
 
-出力は **ネストしていない標準 CSS** にする。
+- Static name: the root MUST match `^-?[a-z][a-zA-Z0-9_-]*`. The remainder MAY contain letters,
+  digits, `_`, `-`, `.` (only between digits), `%` (only at the end and only after a digit), and
+  at most one `/` (not at the end). A root ending in `-` with an empty remainder is invalid.
+- Functional name: MUST end in `-*`, and the text before `-*` MUST match `^-?[a-z][a-zA-Z0-9_-]*$`.
 
-- ネストしたスタイルルール: 親セレクタで `&` を置換 (`&` を含まないネストは暗黙の子孫結合子ではなく `&` を先頭に補う)。親がセレクタリストなら `:is(...)` に包む。`&` だけのルールは子をそのまま親に展開。
-- 宣言を持つルールの中にネストしたルールは、親ルールの **後** に兄弟として出力。
-- スタイルルールの中の at-rule (`@media` 等) は外側へ巻き上げ、その中にスタイルルールを置く。at-rule 同士のネストは保持する (`@media a { @media b { … } }`)。
-- 同じ親の中で同じ (セレクタ, プロパティ) が並ぶ場合の重複宣言除去や、`@scope` の特殊扱いは任意。
+### 10.6 `--value(...)` and `--modifier(...)` Resolution
 
-例:
+Inside a functional `@utility` body, each declaration value is parsed and every `--value(...)` or
+`--modifier(...)` call is replaced by the first argument that resolves. Before resolution the
+arguments are normalized: `\*` becomes `*`, `--a --b` becomes `--a-*--b`, whitespace is removed,
+repeated `-*` collapses to one, and a bare `--x` (no parentheses, no `-*`) becomes `--x-*`.
+
+Argument forms and what they resolve against (`--value` uses the candidate's value, `--modifier`
+uses the modifier):
+
+- `'literal'` or `"literal"`: a named value equal to the literal.
+- `--ns-*`: `theme.resolve(value, ["--ns"])`.
+- `--ns-*--sub`: the `--sub` entry from `resolveWith(value, ["--ns"], ["--sub"])`.
+- `number`, `integer`, `ratio`, `percentage`: a named value that type-checks. `ratio` uses the
+  candidate's `fraction` and both parts MUST be positive integers; `number` MUST be a multiple of
+  0.25; `percentage` MUST be an integer followed by `%`. A `ratio` result is printed as
+  `<a> / <b>`.
+- `[type]`: an arbitrary value. `[*]` accepts anything. When the candidate carries a type hint it
+  MUST equal `type`. Otherwise the value MUST infer as `type` (Section 10.7).
+- `--default(<v>)`: used only when the candidate has no value (or no modifier).
+
+Any other bare word is an unsupported data type; implementations SHOULD warn and MUST ignore it.
+
+Validity of the whole utility for a candidate:
+
+- At least one `--value(...)` MUST be present and at least one MUST resolve; otherwise no output.
+- A declaration whose `--value` or `--modifier` did not resolve is removed.
+- When `--modifier(...)` was used, did not resolve, and the candidate has a modifier, no output.
+- When a `ratio` value resolved and a `--modifier` also resolved, no output.
+- When the candidate has a modifier that was consumed neither by `ratio` nor by `--modifier`, no
+  output.
+- When a `ratio` value resolved, remove every declaration that resolved a non-ratio `--value`.
+
+### 10.7 Data Type Inference
+
+`inferDataType(value, types)` returns the first type in `types` whose predicate accepts `value`,
+or null. A value starting with `var(` never matches. The predicates are:
+
+- `color`: named colors, `#` hex, `rgb`, `rgba`, `hsl`, `hsla`, `oklch`, `oklab`, `lab`, `lch`,
+  `color`, `color-mix`, `light-dark` function calls, `transparent`, `currentcolor`.
+- `length`: a number followed by a length unit (`px`, `rem`, `em`, `vh`, `vw`, `svh`, `cqw`, and
+  the other CSS length units), `0`, math functions, `--spacing(...)`.
+- `percentage`: a number followed by `%`, or a math function.
+- `number`: a number.
+- `integer`: a non-negative integer.
+- `ratio`: `<number>/<number>` with optional spaces.
+- `url`: `url(...)`.
+- `image`: `image`, `image-set`, `cross-fade`, `element` calls and any `*-gradient(...)`.
+- `position`: combinations of `top`, `right`, `bottom`, `left`, `center` and lengths.
+- `bg-size`: `cover`, `contain`, `auto`, or one or two lengths or percentages.
+- `line-width`: `thin`, `medium`, `thick`, or a length.
+- `absolute-size`: `xx-small` through `xxx-large`; `relative-size`: `larger`, `smaller`.
+- `family-name` and `generic-name`: font family names and the generic families.
+- `angle`: a number with `deg`, `rad`, `grad`, or `turn`; `vector`: three space-separated numbers.
+
+### 10.8 Built-in Utility Catalog
+
+The catalog below lists the utilities a conforming implementation MUST provide, grouped by area.
+Each entry gives the class pattern and the CSS it produces. Namespaces in parentheses are the
+`themeKeys` used for named values, in order.
+
+Layout:
+
+- `block`, `inline-block`, `inline`, `flex`, `inline-flex`, `grid`, `inline-grid`, `hidden`,
+  `contents`, `flow-root`, `table`, `table-cell`, `table-row`, `list-item`: `display: <value>`
+  (`hidden` is `display: none`).
+- `static`, `fixed`, `absolute`, `relative`, `sticky`: `position: <value>`.
+- `visible`, `invisible`, `collapse`: `visibility: visible | hidden | collapse`.
+- `isolate`, `isolation-auto`: `isolation: isolate | auto`.
+- `box-border`, `box-content`: `box-sizing: border-box | content-box`.
+- `overflow-{auto,hidden,clip,visible,scroll}` and the `overflow-x-*`, `overflow-y-*` forms.
+- `float-{left,right,start,end,none}`, `clear-{left,right,start,end,both,none}`.
+- `sr-only`: `position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow:
+  hidden; clip-path: inset(50%); white-space: nowrap; border-width: 0`. `not-sr-only` reverses
+  it.
+- `inset`, `inset-x`, `inset-y`, `inset-s`, `inset-e`, `top`, `right`, `bottom`, `left`:
+  `spacingUtility` (`--inset`, `--spacing`) targeting `inset`, `inset-inline`, `inset-block`,
+  `inset-inline-start`, `inset-inline-end`, `top`, `right`, `bottom`, `left`; negative and
+  fractions supported; plus static `<name>-auto`, `<name>-full` (`100%`), `-<name>-full`
+  (`-100%`).
+- `z-<n>`: `z-index` (`--z-index`); bare non-negative integers; negative supported; `z-auto`.
+- `order-<n>`: `order` (`--order`); bare non-negative integers; negative supported;
+  `order-first` is `-9999`, `order-last` is `9999`.
+
+Flexbox and grid:
+
+- `flex-row`, `flex-row-reverse`, `flex-col`, `flex-col-reverse`: `flex-direction`.
+- `flex-wrap`, `flex-nowrap`, `flex-wrap-reverse`: `flex-wrap`.
+- `flex-auto` (`flex: auto`), `flex-initial` (`flex: 0 auto`), `flex-none` (`flex: none`),
+  `flex-<n>` (bare non-negative integer, `flex: <n>`), `flex-<a>/<b>` (`flex: calc(a/b * 100%)`),
+  `flex-[...]`.
+- `grow`, `grow-<n>`, `shrink`, `shrink-<n>`: `flex-grow` and `flex-shrink` (default `1`).
+- `basis-*`: `flex-basis` (`--flex-basis`, `--spacing`, `--container`); fractions supported;
+  `basis-auto`, `basis-full`.
+- `grid-cols-<n>`: `grid-template-columns: repeat(<n>, minmax(0, 1fr))`; `grid-cols-none`,
+  `grid-cols-subgrid`; arbitrary values verbatim. `grid-rows-*` likewise.
+- `col-span-<n>`: `grid-column: span <n> / span <n>`; `col-span-full`: `grid-column: 1 / -1`;
+  `col-start-<n>`, `col-end-<n>`, `col-<n>`; `row-*` likewise.
+- `grid-flow-{row,col,dense,row-dense,col-dense}`; `auto-cols-{auto,min,max,fr}`,
+  `auto-rows-*`.
+- `gap`, `gap-x`, `gap-y`: `spacingUtility` (`--gap`, `--spacing`) targeting `gap`, `column-gap`,
+  `row-gap`.
+- `justify-{normal,center,start,end,between,around,evenly,stretch,baseline}`,
+  `justify-items-*`, `justify-self-*`, `items-{center,start,end,baseline,stretch}`,
+  `content-*`, `self-*`, `place-content-*`, `place-items-*`, `place-self-*`.
+
+Spacing:
+
+- `p`, `px`, `py`, `ps`, `pe`, `pt`, `pr`, `pb`, `pl`: `spacingUtility` (`--padding`,
+  `--spacing`) targeting `padding`, `padding-inline`, `padding-block`, `padding-inline-start`,
+  `padding-inline-end`, `padding-top`, `padding-right`, `padding-bottom`, `padding-left`.
+- `m`, `mx`, `my`, `ms`, `me`, `mt`, `mr`, `mb`, `ml`: `spacingUtility` (`--margin`,
+  `--spacing`) on the corresponding `margin*` properties; negative supported; plus `<name>-auto`.
+
+Sizing:
+
+- `w`, `min-w`, `max-w`: `spacingUtility` (`--width` or `--min-width` or `--max-width`,
+  `--spacing`, `--container`) with fractions; `h`, `min-h`, `max-h` (`--height` and friends,
+  `--spacing`) with fractions; `size-*` sets `width` and `height` together and emits
+  `--lm-sort: size` first.
+- Static sizes: `w-auto`, `w-full`, `w-screen`, `w-svw`, `w-lvw`, `w-dvw`, `w-min`, `w-max`,
+  `w-fit`, and the `h-*` counterparts with `vh` units.
+
+Typography:
+
+- `font-<family>`: `font-family` from `--font-*` with the sub-keys `--font-feature-settings` and
+  `--font-variation-settings` emitted as `font-feature-settings` and `font-variation-settings`
+  when present.
+- `font-<weight>`: from `--font-weight-*`; emits `at-root @property --lm-font-weight`,
+  `--lm-font-weight: <value>`, and `font-weight: <value>`. An arbitrary value infers `number`
+  (weight) versus `family-name` or `generic-name` (family).
+- `text-<size>`: from `--text-*` with sub-keys `--line-height`, `--letter-spacing`,
+  `--font-weight`; emits `font-size`, then `line-height: var(--lm-leading, <sub>)`,
+  `letter-spacing: var(--lm-tracking, <sub>)`, `font-weight: var(--lm-font-weight, <sub>)` for
+  the sub-keys that exist. A modifier `/<leading>` resolves against `--leading`, then as a
+  spacing multiplier (`--spacing(<n>)`), then `none` as `1`, and replaces the line-height
+  declaration; an unresolvable modifier invalidates the candidate.
+- `text-<color>`: `color` (`--text-color`, `--color`). An arbitrary value infers `color` versus
+  `length`, `percentage`, `absolute-size`, `relative-size` (font size).
+- `text-left`, `text-center`, `text-right`, `text-justify`, `text-start`, `text-end`:
+  `text-align`.
+- `leading-*`: `spacingUtility` (`--leading`, `--spacing`) emitting `at-root @property
+  --lm-leading`, `--lm-leading: <v>`, `line-height: <v>`; `leading-none` is `1`.
+- `tracking-*`: `letter-spacing` (`--tracking`); negative supported; emits `--lm-tracking`.
+- `uppercase`, `lowercase`, `capitalize`, `normal-case`: `text-transform`.
+- `italic`, `not-italic`: `font-style`.
+- `underline`, `overline`, `line-through`, `no-underline`: `text-decoration-line`.
+- `truncate` (`overflow: hidden; text-overflow: ellipsis; white-space: nowrap`), `text-ellipsis`,
+  `text-clip`.
+- `whitespace-{normal,nowrap,pre,pre-line,pre-wrap,break-spaces}`, `break-{normal,all,keep}`,
+  `list-{none,disc,decimal}`, `list-inside`, `list-outside`, `antialiased`,
+  `subpixel-antialiased`.
+- `underline-offset-<n>`: `text-underline-offset` (`--text-underline-offset`); bare integers
+  become `<n>px`; negative supported; `underline-offset-auto`.
+- `indent-*`: `spacingUtility` (`--text-indent`, `--spacing`) on `text-indent`; negative
+  supported.
+
+Backgrounds and borders:
+
+- `bg-<value>`: named values resolve first as a color (`--background-color`, `--color`) giving
+  `background-color`, then as an image (`--background-image`) giving `background-image`. An
+  arbitrary value infers, in order, `image`, `color`, `percentage`, `position`, `bg-size`,
+  `length`, `url`; `percentage` and `position` give `background-position`; `bg-size` and
+  `length` give `background-size`; `image` and `url` give `background-image`; anything else is
+  treated as a color with the modifier applied. A modifier on a non-color value invalidates the
+  candidate.
+- `bg-auto`, `bg-cover`, `bg-contain`, `bg-fixed`, `bg-local`, `bg-scroll`, `bg-top`,
+  `bg-center`, `bg-bottom`, `bg-left`, `bg-right`, `bg-repeat`, `bg-no-repeat`, `bg-repeat-x`,
+  `bg-repeat-y`, `bg-none`, `bg-clip-{border,padding,content,text}`,
+  `bg-origin-{border,padding,content}`.
+- `border`, `border-x`, `border-y`, `border-s`, `border-e`, `border-t`, `border-r`, `border-b`,
+  `border-l`: no value gives width `--default-border-width` (theme) or `1px`; a named color
+  (`--border-color`, `--color`) gives the color declarations; a named width from
+  `--border-width` or a bare non-negative integer `<n>` (as `<n>px`) gives width; an arbitrary
+  value infers `color`, `line-width`, `length`. Width output is `at-root @property
+  --lm-border-style { initial-value: solid }`, then `border-style: var(--lm-border-style)`, then
+  the `border-width` (or side-specific width) declaration.
+- `border-solid`, `border-dashed`, `border-dotted`, `border-double`, `border-hidden`,
+  `border-none`: `--lm-border-style: <v>; border-style: <v>`.
+- `rounded`, `rounded-s`, `rounded-e`, `rounded-t`, `rounded-r`, `rounded-b`, `rounded-l`,
+  `rounded-ss`, `rounded-se`, `rounded-ee`, `rounded-es`, `rounded-tl`, `rounded-tr`,
+  `rounded-br`, `rounded-bl`: `functionalUtility` (`--radius`) on the corresponding
+  `border-*-radius` properties; `rounded-none` is `0`; `rounded-full` is
+  `calc(infinity * 1px)`.
+
+Effects, transitions, interactivity:
+
+- `opacity-<n>`: `opacity` (`--opacity`); a bare value that is a multiple of 0.25 becomes
+  `<n>%`.
+- `transition`: `transition-property: color, background-color, border-color, outline-color,
+  text-decoration-color, fill, stroke, --lm-gradient-from, --lm-gradient-via, --lm-gradient-to,
+  opacity, box-shadow, transform, translate, scale, rotate, filter, -webkit-backdrop-filter,
+  backdrop-filter, display, content-visibility, overlay, pointer-events` followed by
+  `transition-timing-function: var(--default-transition-timing-function)` and
+  `transition-duration: var(--default-transition-duration)`; `transition-none`,
+  `transition-all`, `transition-colors`, `transition-opacity`, `transition-shadow`,
+  `transition-transform` select subsets.
+- `duration-<n>`: `transition-duration: <n>ms` (`--transition-duration`); `delay-<n>` likewise;
+  `ease-*`: `transition-timing-function` (`--ease`); `ease-linear`, `ease-initial`.
+- `animate-*`: `animation` (`--animate`); `animate-none`.
+- `cursor-*`, `select-{none,text,all,auto}`, `pointer-events-{none,auto}`, `resize`,
+  `resize-{none,x,y}`, `appearance-{none,auto}`, `scroll-{auto,smooth}`, `will-change-*`,
+  `content-[...]` (`--lm-content` plus `content`), `aspect-*` (`--aspect`; `ratio` values as
+  `a / b`; `aspect-square`, `aspect-video`, `aspect-auto`), `columns-*`, `object-{contain,
+  cover,fill,none,scale-down}`, `accent-*`, `caret-*`, `fill-*`, `stroke-*` (`colorUtility`).
+
+Implementations MAY provide additional utilities (shadows, rings, gradients, masks, transforms,
+filters, and others) using the same helpers and the same variable conventions.
+
+## 11. Compilation and Ordering
+
+### 11.1 `compileCandidates(rawCandidates, designSystem, options)`
+
+1. For each raw candidate: skip it when it is in `invalidCandidates`; parse it; skip it (and
+   report it invalid) when parsing yields nothing.
+2. For each interpretation, call `compileAstNodes` (Section 11.2). When no interpretation yields
+   rules, report the raw candidate invalid.
+3. Attach `{ propertySort, variantOrder, candidate }` to every generated rule node, where
+   `variantOrder` is the bitwise OR of `1 << index` for each variant's index from
+   `getVariantOrder()`.
+4. Sort the rule nodes (Section 11.3).
+
+Options: `respectImportant` (default true) controls whether the design-system-wide `important`
+flag applies; `onInvalidCandidate` receives each invalid raw candidate.
+
+### 11.2 `compileAstNodes(candidate, flags)`
+
+1. Compile the base utility:
+   - An `arbitrary` candidate yields `[declaration(property, asColor(value, modifier))]`; a null
+     color makes it invalid.
+   - Otherwise iterate the definitions for `candidate.root` whose `kind` matches, first the
+     regular definitions and then the fallback definitions, applying the return-value contract of
+     Section 4.1.7. Collect every successful node list.
+2. For each node list: compute `propertySort` (Section 11.3); when the candidate is `important`
+   or the design system is `important` and `flags` includes `RESPECT_IMPORTANT`, mark every
+   declaration `important` except those inside `at-root` nodes.
+3. Create `rule(".<escape(raw)>", nodes)` and apply `candidate.variants` in order with
+   `applyVariant`. Any rejection makes the whole candidate produce nothing.
+4. Substitute theme functions in the result and expand nested `@variant`; on failure produce
+   nothing.
+
+### 11.3 Ordering
+
+`propertySort` for a node list:
+
+- Walk the nodes breadth first. Count every declaration with a defined value (`count`).
+- For each declaration, look up its property in the global property order (Section 11.4). Add
+  the index when found. A declaration `--lm-sort: <property>` contributes the index of
+  `<property>` and stops further property lookups for this node list.
+- `order` is the sorted list of collected indices.
+
+Sort comparison for two rule nodes:
+
+1. Ascending `variantOrder` (as an arbitrary-precision integer).
+2. The first differing entry of `order`, ascending; a missing entry counts as infinity.
+3. Descending `count`.
+4. `compare(candidateA, candidateZ)`.
+
+### 11.4 Global Property Order
+
+The ordered list of properties that determines the relative position of generated rules. An
+implementation MUST use this list verbatim.
+
+```text
+container-type pointer-events visibility position inset inset-inline inset-block
+inset-inline-start inset-inline-end inset-block-start inset-block-end top right bottom left
+isolation z-index order grid-column grid-column-start grid-column-end grid-row grid-row-start
+grid-row-end float clear --lm-container-component margin margin-inline margin-block
+margin-inline-start margin-inline-end margin-block-start margin-block-end margin-top margin-right
+margin-bottom margin-left box-sizing display field-sizing aspect-ratio height max-height
+min-height width max-width min-width flex flex-shrink flex-grow flex-basis table-layout
+caption-side border-collapse border-spacing --lm-border-spacing-x --lm-border-spacing-y
+transform-origin translate --lm-translate-x --lm-translate-y --lm-translate-z scale --lm-scale-x
+--lm-scale-y --lm-scale-z rotate --lm-rotate-x --lm-rotate-y --lm-rotate-z --lm-skew-x
+--lm-skew-y transform zoom animation cursor touch-action --lm-pan-x --lm-pan-y --lm-pinch-zoom
+resize scroll-snap-type --lm-scroll-snap-strictness scroll-snap-align scroll-snap-stop
+scroll-margin scroll-margin-inline scroll-margin-block scroll-margin-inline-start
+scroll-margin-inline-end scroll-margin-block-start scroll-margin-block-end scroll-margin-top
+scroll-margin-right scroll-margin-bottom scroll-margin-left scroll-padding scroll-padding-inline
+scroll-padding-block scroll-padding-inline-start scroll-padding-inline-end
+scroll-padding-block-start scroll-padding-block-end scroll-padding-top scroll-padding-right
+scroll-padding-bottom scroll-padding-left scrollbar-width scrollbar-color scrollbar-gutter
+list-style-position list-style-type list-style-image appearance columns break-before
+break-inside break-after grid-auto-columns grid-auto-flow grid-auto-rows grid-template-columns
+grid-template-rows flex-direction flex-wrap place-content place-items align-content align-items
+justify-content justify-items gap column-gap row-gap --lm-space-x-reverse --lm-space-y-reverse
+divide-x-width divide-y-width --lm-divide-y-reverse divide-style divide-color place-self
+align-self justify-self overflow overflow-x overflow-y overscroll-behavior overscroll-behavior-x
+overscroll-behavior-y scroll-behavior border-radius border-start-radius border-end-radius
+border-top-radius border-right-radius border-bottom-radius border-left-radius
+border-start-start-radius border-start-end-radius border-end-end-radius border-end-start-radius
+border-top-left-radius border-top-right-radius border-bottom-right-radius
+border-bottom-left-radius border-width border-inline-width border-block-width
+border-inline-start-width border-inline-end-width border-block-start-width
+border-block-end-width border-top-width border-right-width border-bottom-width
+border-left-width border-style border-inline-style border-block-style border-inline-start-style
+border-inline-end-style border-block-start-style border-block-end-style border-top-style
+border-right-style border-bottom-style border-left-style border-color border-inline-color
+border-block-color border-inline-start-color border-inline-end-color border-block-start-color
+border-block-end-color border-top-color border-right-color border-bottom-color
+border-left-color background-color background-image --lm-gradient-position
+--lm-gradient-stops --lm-gradient-via-stops --lm-gradient-from --lm-gradient-from-position
+--lm-gradient-via --lm-gradient-via-position --lm-gradient-to --lm-gradient-to-position
+mask-image --lm-mask-top --lm-mask-top-from-color --lm-mask-top-from-position
+--lm-mask-top-to-color --lm-mask-top-to-position --lm-mask-right --lm-mask-right-from-color
+--lm-mask-right-from-position --lm-mask-right-to-color --lm-mask-right-to-position
+--lm-mask-bottom --lm-mask-bottom-from-color --lm-mask-bottom-from-position
+--lm-mask-bottom-to-color --lm-mask-bottom-to-position --lm-mask-left --lm-mask-left-from-color
+--lm-mask-left-from-position --lm-mask-left-to-color --lm-mask-left-to-position
+--lm-mask-linear --lm-mask-linear-position --lm-mask-linear-from-color
+--lm-mask-linear-from-position --lm-mask-linear-to-color --lm-mask-linear-to-position
+--lm-mask-radial --lm-mask-radial-shape --lm-mask-radial-size --lm-mask-radial-position
+--lm-mask-radial-from-color --lm-mask-radial-from-position --lm-mask-radial-to-color
+--lm-mask-radial-to-position --lm-mask-conic --lm-mask-conic-position
+--lm-mask-conic-from-color --lm-mask-conic-from-position --lm-mask-conic-to-color
+--lm-mask-conic-to-position box-decoration-break background-size background-attachment
+background-clip background-position background-repeat background-origin mask-composite
+mask-mode mask-type mask-size mask-clip mask-position mask-repeat mask-origin fill stroke
+stroke-width object-fit object-position padding padding-inline padding-block
+padding-inline-start padding-inline-end padding-block-start padding-block-end padding-top
+padding-right padding-bottom padding-left text-align text-indent vertical-align font-family
+font-feature-settings font-size line-height font-weight letter-spacing text-wrap overflow-wrap
+word-break text-overflow hyphens white-space tab-size color text-transform font-style
+font-stretch font-variant-numeric text-decoration-line text-decoration-color
+text-decoration-style text-decoration-thickness text-underline-offset -webkit-font-smoothing
+placeholder-color caret-color accent-color color-scheme opacity background-blend-mode
+mix-blend-mode box-shadow --lm-shadow --lm-shadow-color --lm-ring-shadow --lm-ring-color
+--lm-inset-shadow --lm-inset-shadow-color --lm-inset-ring-shadow --lm-inset-ring-color
+--lm-ring-offset-width --lm-ring-offset-color outline outline-width outline-offset
+outline-color --lm-blur --lm-brightness --lm-contrast --lm-drop-shadow --lm-grayscale
+--lm-hue-rotate --lm-invert --lm-saturate --lm-sepia filter --lm-backdrop-blur
+--lm-backdrop-brightness --lm-backdrop-contrast --lm-backdrop-grayscale
+--lm-backdrop-hue-rotate --lm-backdrop-invert --lm-backdrop-opacity --lm-backdrop-saturate
+--lm-backdrop-sepia backdrop-filter transition-property transition-behavior transition-delay
+transition-duration transition-timing-function will-change contain content
+forced-color-adjust
 ```
-.hover\:underline { &:hover { @media (hover: hover) { text-decoration-line: underline; } } }
-→
+
+## 12. Output Optimization and Serialization
+
+`optimizeAst(ast)` runs on the whole document (stylesheet plus generated utilities) before every
+serialization.
+
+### 12.1 Transformation Pass
+
+Build a new AST depth first:
+
+- Declaration: drop `--lm-sort` and undefined values. Inside `context { theme: true }` a `--`
+  declaration is tracked for pruning (Section 7.6); a value of `initial` is dropped. When the
+  value contains `var(`, record variable usage (as a dependency when the declaration is itself a
+  theme variable, as a use otherwise). An `animation` declaration records keyframe names (split
+  on whitespace and commas).
+- Rule: transform children; drop the rule when it becomes empty.
+- `@property` at depth 0: print each registration name once; later duplicates are dropped.
+- Other at-rules: transform children. Drop empty at-rules except `@layer`, `@charset`,
+  `@custom-media`, `@namespace`, `@import`, and `@apply`. Record `@keyframes` found inside
+  `context { theme: true }` as prunable.
+- `at-root`: transform children at depth 0 and collect them into a separate list.
+- `context`: when `reference` is set, drop the subtree. Otherwise transform children into the
+  current parent while merging the context map.
+- Comment: keep.
+
+### 12.2 Post-processing
+
+1. Prune unused theme variables and keyframes (Section 7.6).
+2. Append the collected root-level nodes to the end of the document.
+3. Flatten nesting (Section 12.3).
+
+### 12.3 Nesting Flattening
+
+The output MUST be flat CSS:
+
+- A nested style rule is merged with its parent selector by replacing `&`. A nested selector
+  without `&` is treated as `& <selector>` only when it is a relative selector; otherwise `&` is
+  prepended. A parent selector list is wrapped in `:is(...)` before substitution.
+- A rule whose selector is exactly `&` is replaced by its children.
+- At-rules nested inside style rules are hoisted above the rule; the rule is emitted inside the
+  at-rule. Nested at-rules remain nested in each other.
+- Declarations that precede nested rules stay with the parent rule, which is emitted before the
+  hoisted children.
+
+Example: `.hover\:underline { &:hover { @media (hover: hover) { text-decoration-line: underline; } } }`
+becomes:
+
+```css
 @media (hover: hover) {
   .hover\:underline:hover {
     text-decoration-line: underline;
@@ -782,143 +1394,296 @@ Compounds = Never(0) | AtRules(1) | StyleRules(2)   // ビット集合
 }
 ```
 
-### 10.4 ポリフィル (任意)
+### 12.4 Polyfills (OPTIONAL)
 
-- **AtProperty**: 各 `@property` について `initial-value` (無ければ `initial`) の宣言を集め、`inherits: true` なら `:root, :host { … }`、それ以外は `*, ::before, ::after, ::backdrop { … }` にまとめ、`@layer properties { @supports ((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b)))) { … } }` として末尾に出力。ドキュメント先頭 (ライセンスコメント・`@charset`・外部 `@import` の後) に `@layer properties;` を挿入。
-- **ColorMix**: `color-mix(…)` を含む宣言のうち `var(--x)` を参照するものを、変数を生の値に置き換えた宣言 (色空間を `srgb` に) と `@supports (color: color-mix(in lab, red, red)) { 元の宣言 }` の 2 つにする。
+- Property registration fallback: for every `@property`, collect a declaration
+  `<name>: <initial-value or initial>`; group those with `inherits: true` under `:root, :host`
+  and the rest under `*, ::before, ::after, ::backdrop`; emit them at the end of the document
+  as `@layer properties { @supports ((-webkit-hyphens: none) and (not (margin-trim: inline))) or
+  ((-moz-orient: inline) and (not (color:rgb(from red r g b)))) { ... } }` and insert an empty
+  `@layer properties;` statement after any leading license comments, `@charset`, and external
+  `@import` statements.
+- Color-mix fallback: for each declaration using `color-mix(...)` with `var(...)` arguments,
+  emit a copy with the variables replaced by their raw theme values (color space `srgb`)
+  followed by `@supports (color: color-mix(in lab, red, red)) { <original> }`.
 
----
+## 13. Source Scanning and Candidate Extraction
 
-## 11. ソース走査と候補抽出
+### 13.1 Source Set Assembly (Host Responsibility)
 
-### 11.1 ソースの決定 (CLI)
-
-```
+```text
 sources = []
-if compiler.root === 'none':   何も追加しない
-if compiler.root === null:     { base: <cwd>, pattern: '**/*', negated: false }
-else:                          { ...compiler.root, negated: false }
-sources += compiler.sources                                  // @source 由来
-sources += { base: dirname(execPath), pattern: basename(execPath), negated: true }  // 自分自身を除外
-if input file:  sources += { base: dirname(input), pattern: basename(input), negated: false }
+if compiler.root == "none":       (add nothing)
+else if compiler.root == null:    sources += { base: cwd, pattern: "**/*", negated: false }
+else:                             sources += { ...compiler.root, negated: false }
+sources += compiler.sources
+sources += { base: dirname(executable), pattern: basename(executable), negated: true }
+if input file:                    sources += { base: dirname(input), pattern: basename(input), negated: false }
 ```
 
-### 11.2 自動検出 (`**/*` パターンのソース)
+### 13.2 Auto-detection Rules
 
-`base` 以下を再帰的に歩く。以下を除外する:
+For a `**/*` source the scanner walks `base` recursively and excludes:
 
-- `.gitignore` (階層ごと) に一致するもの。
-- ディレクトリ: `.git .hg .jj .next .parcel-cache .pnpm-store .svelte-kit .svn .turbo .venv .vercel .yarn __pycache__ node_modules venv`
-- 拡張子: `less lock sass scss styl log`、およびバイナリ拡張子一覧 (`crates/oxide/src/scanner/fixtures/binary-extensions.txt`: 画像・音声・動画・アーカイブ・フォント・実行ファイル等)。
-- ファイル名: `package-lock.json pnpm-lock.yaml bun.lockb .gitignore .env .env.*`
-- `negated` ソースに一致するパス。
+- Paths matched by any `.gitignore` encountered along the way.
+- Directories named `.git`, `.hg`, `.jj`, `.next`, `.parcel-cache`, `.pnpm-store`,
+  `.svelte-kit`, `.svn`, `.turbo`, `.venv`, `.vercel`, `.yarn`, `__pycache__`, `node_modules`,
+  `venv`.
+- Files with the extensions `less`, `lock`, `sass`, `scss`, `styl`, `log`.
+- Files with common binary extensions (images, audio, video, archives, fonts, executables).
+- Files named `package-lock.json`, `pnpm-lock.yaml`, `bun.lockb`, `.gitignore`, `.env`, and
+  `.env.*`.
+- Paths matched by a negated source.
 
-明示的な `@source "<glob>"` は上記の除外 (gitignore 含む) を **無視して** 一致ファイルを含める (例: `@source "../node_modules/my-lib"`)。glob は `**` `*` `{a,b}` をサポートする。
+An explicit `@source "<glob>"` bypasses the ignore rules above so that ignored directories can be
+opted in. Globs support `**`, `*`, and `{a,b}`.
 
-### 11.3 走査 API
+### 13.3 Scanner Interface
 
+- `new(sources)`.
+- `scan()`: walk every source, read files whose modification time changed since the last scan
+  (all files on the first scan), extract candidates, and return the full deduplicated candidate
+  set seen so far.
+- `scanFiles(changed)`: read only the given files and return only candidates not seen before.
+- `scannedFiles`: the files read by the most recent `scan()`.
+
+### 13.4 Extraction Rules
+
+Extraction MUST favor recall over precision: an unrecognized candidate produces no CSS and is
+harmless, while a missed candidate is a visible bug. Implementations SHOULD still reject obvious
+prose to keep the candidate set small.
+
+Scan the input as bytes and emit every maximal span that satisfies:
+
+- The byte before the span is a start boundary: whitespace, a quote (`"`, `'`, or backtick),
+  start of input, `.`, `}`, or `>`.
+- The byte after the span is an end boundary: whitespace, a quote, end of input, `]`, `{`, `=`,
+  `\`, or `<`.
+- The span matches `(variant ":")* utility` where:
+  - a variant is `[...]` with balanced brackets, or a name starting with a letter or `@`
+    followed by letters, digits, `_`, `-`, an optional `-[...]` or `-(...)`, and an optional
+    `/modifier`;
+  - a utility is `[property:value]` with balanced brackets, or a name starting with a letter,
+    `@`, or `-` followed by a letter or digit (`-@` is not allowed), continuing with letters,
+    digits, `_`, `-`, `.` between digits, `%`, `-[...]`, `-(...)`, an optional trailing
+    `/modifier` (`/[...]`, `/(...)`, or a name), and an optional trailing `!`;
+  - `-` and `_` MUST NOT end a name; a leading `!` is accepted.
+- Additionally emit every `--` followed by letters, digits, `_`, or `-` under the same boundary
+  rules (custom property references).
+
+## 14. Command-Line Interface
+
+### 14.1 Invocation
+
+```text
+loom [build] [--input input.css] [--output output.css] [--watch] [--poll=ms] [options...]
 ```
-Scanner.new(sources)
-scan() -> string[]                  // 全ファイルを走査し、これまでに見つかった全候補 (重複なし) を返す。2 回目以降は mtime の変わったファイルだけ再読込
-scanFiles(changed: {file, extension}[]) -> string[]   // 指定ファイルだけ走査し、新規候補だけを返す
-scannedFiles                        // 直近の scan で読み込んだファイル
+
+Options:
+
+- `-i, --input <path>`: entry stylesheet; `-` reads stdin. When omitted the input is the single
+  line `@import 'loom';`.
+- `-o, --output <path>`: output file; `-` (the default) writes stdout.
+- `-w, --watch [always]`: rebuild on changes. `always` keeps watching after stdin closes.
+- `--poll [ms]`: poll instead of using filesystem events; the default interval is 250 ms. A
+  non-positive interval is an error.
+- `-m, --minify`: optimize and minify the output.
+- `--optimize`: optimize without minifying.
+- `--cwd <dir>`: base directory (default `.`).
+- `--silent`: suppress everything except errors.
+- `-h, --help`: usage.
+
+Behavior:
+
+- A missing input file, or identical input and output paths, MUST exit with status 1 and a
+  message.
+- With no arguments on a TTY the tool prints usage.
+- The banner and `Done in <duration>` MUST go to stderr so that stdout stays clean for CSS.
+- When writing to stdout, output MUST be printed only when it differs from the previous write.
+
+### 14.2 Single Build
+
+1. Read the input. Call `compile(css, { base: dirname(input) or cwd, loadStylesheet })`. The
+   loader resolves relative ids against `base`, resolves the id `loom` to the bundled
+   `index.css`, and records every loaded path as a full-rebuild path.
+2. Assemble sources (Section 13.1) and create the scanner.
+3. `candidates = scanner.scan()`; `css = compiler.build(candidates)`; write (Section 14.5).
+
+### 14.3 Watch Mode (Event Driven)
+
+Watch every distinct source `base` directory recursively. On a batch of changed paths:
+
+- Ignore the batch when it contains only the output file.
+- If any changed path is a full-rebuild path: re-read the input, recreate the compiler and the
+  scanner, run `scan()`, rebuild, replace the watchers, and write.
+- Otherwise: `newCandidates = scanner.scanFiles(changed)`; when empty, do nothing; otherwise
+  `compiler.build(newCandidates)` and write.
+- Report errors to stderr and keep watching. When a full rebuild fails, restore the previous
+  full-rebuild path list so that a later change to a deleted dependency still triggers a rebuild.
+- Exit when stdin reaches end of file unless `--watch=always`.
+
+### 14.4 Watch Mode (Polling)
+
+Every interval: `candidates = scanner.scan()`; let `files` be `scannedFiles` minus the output
+file; when `files` is empty, do nothing. If any file is a full-rebuild path, perform a full
+rebuild as above. Otherwise, when `candidates` is non-empty, `compiler.build(candidates)` and
+write.
+
+### 14.5 Writing
+
+1. When `--minify` or `--optimize` is set, pass the CSS through the minifier (skipping it when
+   the CSS equals the previous build's CSS). The minifier is implementation-defined; at minimum
+   it MUST preserve semantics, and it SHOULD flatten `@media` range syntax to `min-width` and
+   `max-width` for older browsers.
+2. Write to the output file (creating directories as needed) or to stdout.
+
+## 15. Reference Algorithms (Language-Agnostic)
+
+### 15.1 Compile
+
+```text
+function compile(css, options):
+  ast = parse_css(css)
+  ast = [context({base: options.base}, ast)]
+  features = substitute_at_imports(ast, options.base, options.loadStylesheet)
+
+  theme = new Theme()
+  state = collect_directives(ast, theme)      # Sections 6.4 .. 6.8
+  design = build_design_system(theme)
+  design.important = state.important
+  design.invalidCandidates += state.ignoredCandidates
+
+  for name in state.customVariants (stylesheet order):
+    design.variants.static(name, noop)         # reserve order
+  for name in topological_sort(state.customVariantDependencies):
+    state.customVariants[name](design)
+  for register in state.customUtilities:
+    register(design)
+
+  emit_theme_variables(state.firstThemeRule, design.theme)
+  features |= substitute_at_variant(ast, design)
+  features |= substitute_functions(ast, design)
+  features |= substitute_at_apply(ast, design)
+  convert_utilities_node_to_context(state.utilitiesNode)
+  remove_at_utility_nodes(ast)
+
+  return make_handle(ast, design, state, features, options)
 ```
 
-`.css` ファイルも走査対象に入る (入力 CSS 自身が `sources` に含まれるため `@apply` や `@source inline` の文字列が候補になる)。
+### 15.2 Build
 
-### 11.4 候補抽出 (Oxide 相当の簡易版)
+```text
+function build(candidates):
+  if features == NONE: return original_css
+  if utilitiesNode == null: return serialize(optimize(ast))
 
-抽出器の精度は **再現率 (取りこぼさないこと) が重要で、適合率は重要ではない**。無効な候補は `parseCandidate` で捨てられ CSS を生成しないため、多少の誤検出は無害である。ただし候補数はキャッシュに影響するので、明らかなゴミ (単語や数値) はできるだけ弾く。
+  changed = pendingInlineCandidates
+  for c in candidates:
+    if c in design.invalidCandidates: continue
+    if c starts with "--":
+      changed |= design.theme.markUsedVariable(c)
+    else:
+      changed |= validCandidates.add(c)
+  if not changed: return cached_output
 
-入力をバイト列として走査し、以下を満たす部分文字列を候補として切り出す。
-
-**境界**: 候補の直前は「開始境界」、直後は「終了境界」でなければならない。
-- 共通: 空白 (`\t \n \f \r ' '`)、引用符 (`" ' \``)、入力の端。
-- 開始のみ: `.` `}` `>`
-- 終了のみ: `]` `{` `=` `\` `<`
-
-**候補の構造**: `(<variant>:)* <utility>`
-
-- variant: `[...]` (括弧が釣り合う任意バリアント) または名前つき (`@` 始まり可、`a-zA-Z0-9_-`、`-[…]` / `-(…)` の任意値、`/modifier`) の後に `:`。
-- utility: `[prop:value]` (任意プロパティ) または名前つき。先頭は `a-zA-Z` `@` または `-` (直後が英数字。`-@` は不可)。以降 `a-zA-Z0-9_-` と、`-[…]` (釣り合う括弧)、`-(…)`、`.` (数字に挟まれる: `2.5`)、`%`、末尾の `/modifier` (`/[…]`, `/(…)`, `/名前`)、末尾の `!`。`-` `_` は末尾に来られない。単独の `!` 始まり (旧 important) も許容。
-- CSS 変数 `--[a-zA-Z0-9_-]+` (境界条件は同じ) も候補として抽出する (§2.2 の使用申告)。
-- 抽出後 `has_valid_boundaries` を満たさないものは捨てる。
-
-拡張子ごとのプリプロセッサ (Vue の `<style>` 除去など) は本仕様では実装しない。
-
----
-
-## 12. CLI
-
-### 12.1 コマンドとフラグ
-
-```
-tailwindcss [build] [--input input.css] [--output output.css] [--watch] [--poll=ms] [options…]
+  nodes = compile_candidates(validCandidates, design, on_invalid = add_to_invalid).nodes
+  if nodes.length == previousCount and no variable was newly marked: return cached_output
+  previousCount = nodes.length
+  utilitiesNode.nodes = nodes
+  cached_output = serialize(optimize(ast))
+  return cached_output
 ```
 
-| フラグ | 型 | 既定 | 意味 |
-| --- | --- | --- | --- |
-| `-i, --input <path>` | string | なし | 入力 CSS。`-` で stdin。省略時は `@import 'tailwindcss';` を入力とする |
-| `-o, --output <path>` | string | `-` | 出力先。`-` で stdout |
-| `-w, --watch [always]` | boolean \| `always` | false | 監視モード。`always` は stdin が閉じても継続 |
-| `--poll [ms]` | boolean \| number | false | ファイルシステムイベントの代わりにポーリング (既定 250ms)。0 以下はエラー |
-| `-m, --minify` | boolean | false | 最適化 + 最小化 |
-| `--optimize` | boolean | false | 最小化なしの最適化 |
-| `--cwd <dir>` | string | `.` | 基準ディレクトリ |
-| `--map [path]` | boolean \| string | false | ソースマップ (本仕様では未対応と明示してよい) |
-| `--silent` | boolean | false | エラー以外の出力を抑制 |
-| `-h, --help` | | | ヘルプ |
+### 15.3 Compile Candidates
 
-- 入力パスが存在しなければエラー終了。入力と出力が同じパスならエラー終了。
-- 引数なしで TTY ならヘルプを表示。
-- バナー (`≈ tailwindcss v4.x.y`) と `Done in 12ms` は **stderr** に出す (`--silent` で抑制)。生成 CSS を stdout に出す場合、内容が前回と同じなら再出力しない。
+```text
+function compile_candidates(raws, design, options):
+  matches = []
+  for raw in raws:
+    if raw in design.invalidCandidates: options.on_invalid(raw); continue
+    parsed = design.parseCandidate(raw)
+    if parsed is empty: options.on_invalid(raw); continue
+    matches.append((raw, parsed))
 
-### 12.2 初回ビルド
+  order = design.getVariantOrder()
+  rules = []
+  for (raw, parsed) in matches:
+    found = false
+    for candidate in parsed:
+      for (node, propertySort) in design.compileAstNodes(candidate, flags(options)):
+        found = true
+        variantOrder = OR over v in candidate.variants of (1 << order[v])
+        rules.append((node, propertySort, variantOrder, raw))
+    if not found: options.on_invalid(raw)
 
-1. 入力 CSS を読み、`compile(css, { base: dirname(input) or cwd, loadStylesheet })` する。`loadStylesheet` は解決したファイルパスを「フルリビルド対象」に登録する。
-2. §11.1 でソースを決め、`Scanner` を作る。
-3. `scanner.scan()` → `compiler.build(candidates)` → 書き出し (§12.5)。
+  sort rules by (variantOrder asc, first differing property index asc, count desc, compare(raw))
+  return rules
+```
 
-### 12.3 watch (イベント駆動)
+### 15.4 Apply Variant
 
-走査対象ディレクトリ (ソースの `base` の集合) を再帰監視する。変更ファイル群を受け取ったら:
+```text
+function apply_variant(node, variant, depth = 0):
+  if variant.kind == "arbitrary":
+    if variant.relative and depth == 0: return REJECT
+    node.nodes = [rule(variant.selector, node.nodes)]
+    return OK
 
-- 変更が出力ファイルだけなら無視 (無限ループ防止)。
-- 変更ファイルにフルリビルド対象 (入力 CSS と、それが `@import` したファイル) が含まれれば **フルリビルド**: 入力を読み直し、コンパイラとスキャナを作り直し、`scan()` → `build()`。監視対象も作り直す。
-- そうでなければ **増分ビルド**: `scanner.scanFiles(changed)` で新規候補を得る。空なら何もしない。`compiler.build(newCandidates)` → 書き出し。
-- 例外は stderr に表示して監視を続ける。フルリビルド失敗時はフルリビルド対象の一覧を失敗前のものに戻す (削除→復元を検知できるようにするため)。
-- `--watch=always` でなければ stdin の EOF で終了する。
+  definition = variants[variant.root]
+  if variant.kind == "compound":
+    isolated = at_rule("@slot")
+    if apply_variant(isolated, variant.variant, depth + 1) == REJECT: return REJECT
+    if variant.root == "not" and len(isolated.nodes) > 1: return REJECT
+    for child in isolated.nodes:
+      if child.kind not in (rule, at-rule): return REJECT
+      if definition.apply(child, variant) == REJECT: return REJECT
+    fill_empty_rules(isolated.nodes, with = node.nodes)
+    node.nodes = isolated.nodes
+    return OK
 
-### 12.4 watch (ポーリング)
+  return definition.apply(node, variant)
+```
 
-`--poll` 指定時は一定間隔で `scanner.scan()` を呼び、`scannedFiles` (出力ファイルとマップを除く) が空でなければ §12.3 と同じ判定 (フル or 増分) でビルドする。増分では `scan()` が返した新規候補をそのまま `build` に渡す。
+### 15.5 Watch Tick (Event Driven)
 
-### 12.5 書き出し
+```text
+on_changes(files):
+  if files == [output_path]: return
+  if any(f in full_rebuild_paths for f in files):
+    input = read_input()
+    (compiler, scanner) = create_compiler(input)
+    candidates = scanner.scan()
+    replace_watchers(scanner)
+    write(compiler.build(candidates))
+  else:
+    new_candidates = scanner.scanFiles(files)
+    if new_candidates is empty: return
+    write(compiler.build(new_candidates))
+```
 
-1. `--minify` / `--optimize` なら最適化器を通す (CSS が前回と同じなら前回の結果を再利用)。参照実装は Lightning CSS (nesting とメディアクエリ範囲構文のダウンレベル、targets: Safari 16.4 / iOS 16.4 / Firefox 128 / Chrome 111)。移植版は任意の最小化器、または「空白除去のみ」でもよい。
-2. `--output` がパスならファイルに書く (ディレクトリは作成)。`-` なら変更があったときだけ stdout に出す。
+## 16. Conformance Examples
 
----
+All examples use the bundled default theme and show the serializer's raw output (before any
+minifier). Whitespace follows Section 5.2.
 
-## 13. ゴールデン例 (最適化器なしの生出力)
+### 16.1 Basic Document
 
-以下は `compile` → `build` の出力 (`optimize` を通さない) の期待値。空行と字下げは §3.3 に従う。
+Stylesheet:
 
-### 13.1 基本
-
-入力 CSS:
 ```css
 @theme {
   --color-black: #000;
   --breakpoint-md: 768px;
 }
 @layer utilities {
-  @tailwind utilities;
+  @loom utilities;
 }
 ```
-候補: `flex md:grid hover:underline dark:bg-black`
 
-出力:
+Candidates: `flex`, `md:grid`, `hover:underline`, `dark:bg-black`.
+
+Output:
+
 ```css
 :root, :host {
   --color-black: #000;
@@ -945,70 +1710,78 @@ tailwindcss [build] [--input input.css] [--output output.css] [--watch] [--poll=
 }
 ```
 
-`--breakpoint-md` は変数として参照されない (`@media` に生の値が入る) ため出力されない。
+`--breakpoint-md` is not printed because no `var(...)` references it.
 
-### 13.2 値の種類
+### 16.2 Value Forms
 
-| 候補 | 生成宣言 (テーマは同梱 `theme.css`) |
-| --- | --- |
-| `p-4` | `padding: calc(var(--spacing) * 4);` |
-| `p-1` | `padding: var(--spacing);` |
-| `p-0` | `padding: 0px;` |
-| `p-px` | `padding: 1px;` |
-| `-mt-2` | `margin-top: calc(var(--spacing) * -2);` |
-| `w-1/2` | `width: calc(1 / 2 * 100%);` |
-| `w-[13px]` | `width: 13px;` |
-| `w-(--my-w)` | `width: var(--my-w);` |
-| `max-w-md` | `max-width: var(--container-md);` |
-| `bg-red-500` | `background-color: var(--color-red-500);` |
-| `bg-red-500/50` | `background-color: color-mix(in oklab, var(--color-red-500) 50%, transparent);` |
-| `bg-[#0088cc]` | `background-color: #0088cc;` |
-| `bg-[url(/a_b.png)]` | `background-image: url(/a_b.png);` |
-| `bg-[length:10px_20px]` | `background-size: 10px 20px;` |
-| `text-lg` | `font-size: var(--text-lg); line-height: var(--tw-leading, var(--text-lg--line-height));` |
-| `text-lg/8` | `font-size: var(--text-lg); line-height: calc(var(--spacing) * 8);` |
-| `text-red-500` | `color: var(--color-red-500);` |
-| `font-bold` | `@property --tw-font-weight {…}` (ルートへ) + `--tw-font-weight: var(--font-weight-bold); font-weight: var(--font-weight-bold);` |
-| `rounded` | `border-radius: var(--radius);` (未定義なら無効) / `rounded-lg` → `var(--radius-lg)` |
-| `rounded-full` | `border-radius: calc(infinity * 1px);` |
-| `border` | `border-style: var(--tw-border-style); border-width: 1px;` + `@property --tw-border-style { syntax: "*"; inherits: false; initial-value: solid; }` |
-| `border-2` | 同上で `border-width: 2px;` |
-| `z-10` | `z-index: 10;` / `-z-10` → `z-index: calc(10 * -1);` |
-| `opacity-50` | `opacity: 50%;` |
-| `[mask-type:luminance]` | `mask-type: luminance;` |
-| `[--my-var:1px]` | `--my-var: 1px;` |
-| `underline!` / `!underline` | `text-decoration-line: underline !important;` |
+Each line gives a candidate and the declarations it produces.
 
-### 13.3 バリアント
+```text
+p-4                  padding: calc(var(--spacing) * 4);
+p-1                  padding: var(--spacing);
+p-0                  padding: 0px;
+p-px                 padding: 1px;
+-mt-2                margin-top: calc(var(--spacing) * -2);
+w-1/2                width: calc(1 / 2 * 100%);
+w-[13px]             width: 13px;
+w-(--my-w)           width: var(--my-w);
+max-w-md             max-width: var(--container-md);
+bg-red-500           background-color: var(--color-red-500);
+bg-red-500/50        background-color: color-mix(in oklab, var(--color-red-500) 50%, transparent);
+bg-[#0088cc]         background-color: #0088cc;
+bg-[url(/a_b.png)]   background-image: url(/a_b.png);
+bg-[length:10px_20px] background-size: 10px 20px;
+text-lg              font-size: var(--text-lg); line-height: var(--lm-leading, var(--text-lg--line-height));
+text-lg/8            font-size: var(--text-lg); line-height: calc(var(--spacing) * 8);
+text-red-500         color: var(--color-red-500);
+font-bold            --lm-font-weight: var(--font-weight-bold); font-weight: var(--font-weight-bold);
+                     (plus a hoisted @property --lm-font-weight)
+rounded-lg           border-radius: var(--radius-lg);
+rounded-full         border-radius: calc(infinity * 1px);
+border               border-style: var(--lm-border-style); border-width: 1px;
+                     (plus a hoisted @property --lm-border-style with initial-value: solid)
+border-2             border-style: var(--lm-border-style); border-width: 2px;
+z-10                 z-index: 10;
+-z-10                z-index: calc(10 * -1);
+flex-1               flex: 1;
+opacity-50           opacity: 50%;
+[mask-type:luminance] mask-type: luminance;
+[--my-var:1px]       --my-var: 1px;
+underline!           text-decoration-line: underline !important;
+```
 
-| 候補 | 出力セレクタ / 包み |
-| --- | --- |
-| `hover:flex` | `@media (hover: hover) { .hover\:flex:hover { … } }` |
-| `focus:flex` | `.focus\:flex:focus` |
-| `sm:flex` | `@media (width >= 40rem) { .sm\:flex { … } }` |
-| `max-md:flex` | `@media (width < 48rem) { … }` |
-| `min-[600px]:flex` | `@media (width >= 600px) { … }` |
-| `@md:flex` | `@container (width >= 28rem) { … }` |
-| `@md/main:flex` | `@container main (width >= 28rem) { … }` |
-| `group-hover:flex` | `@media (hover: hover) { .group-hover\:flex:is(:where(.group):hover *) { … } }` |
-| `group-hover/item:flex` | `.group-hover\/item\:flex:is(:where(.group\/item):hover *)` |
-| `peer-checked:flex` | `.peer-checked\:flex:is(:where(.peer):checked ~ *)` |
-| `has-[>img]:flex` | `.has-\[\>img\]\:flex:has(> img)` (任意バリアント `[>img]` 単独では無効、`has-` の子としてのみ有効) |
-| `not-hover:flex` | `.not-hover\:flex:not(:hover)` と `@media not all and (hover: hover) { .not-hover\:flex { … } }` の 2 ルール |
-| `not-supports-grid:flex` | `@supports not (grid: var(--tw)) { … }` |
-| `in-data-visible:flex` | `:where([data-visible]) .in-data-visible\:flex` |
-| `data-[state=open]:flex` | `.data-\[state\=open\]\:flex[data-state="open"]` |
-| `aria-checked:flex` | `.aria-checked\:flex[aria-checked="true"]` |
-| `nth-3:flex` | `.nth-3\:flex:nth-child(3)` |
-| `[&_p]:flex` | `.\[\&_p\]\:flex p` |
-| `[@media(width>=100px)]:flex` | `@media (width>=100px) { … }` |
-| `*:flex` | `:is(.\*\:flex > *)` |
-| `before:block` | `.before\:block::before { content: var(--tw-content); display: block; }` + `@property --tw-content` |
-| `dark:hover:flex` | `@media (prefers-color-scheme: dark) { @media (hover: hover) { .dark\:hover\:flex:hover { … } } }` |
+### 16.3 Variant Forms
 
-出力順は `variantOrder` によって決まり、同じ候補集合なら常に同じ順になる (例: `sm:` より `md:` が後、バリアント無しが先頭)。
+Each line gives a candidate and the selector or wrapper it produces around `.<escaped name>`.
 
-### 13.4 `@utility` と `@apply`
+```text
+hover:flex             @media (hover: hover) { .hover\:flex:hover { ... } }
+focus:flex             .focus\:flex:focus
+sm:flex                @media (width >= 40rem) { .sm\:flex { ... } }
+max-md:flex            @media (width < 48rem) { ... }
+min-[600px]:flex       @media (width >= 600px) { ... }
+@md:flex               @container (width >= 28rem) { ... }
+@md/main:flex          @container main (width >= 28rem) { ... }
+group-hover:flex       @media (hover: hover) { .group-hover\:flex:is(:where(.group):hover *) { ... } }
+group-hover/item:flex  .group-hover\/item\:flex:is(:where(.group\/item):hover *)
+peer-checked:flex      .peer-checked\:flex:is(:where(.peer):checked ~ *)
+has-[>img]:flex        .has-\[\>img\]\:flex:has(> img)
+in-data-visible:flex   :where([data-visible]) .in-data-visible\:flex
+not-hover:flex         .not-hover\:flex:not(:hover)  and  @media not all and (hover: hover) { .not-hover\:flex { ... } }
+not-supports-grid:flex @supports not (grid: var(--lm)) { ... }
+data-[state=open]:flex .data-\[state\=open\]\:flex[data-state="open"]
+aria-checked:flex      .aria-checked\:flex[aria-checked="true"]
+nth-3:flex             .nth-3\:flex:nth-child(3)
+[&_p]:flex             .\[\&_p\]\:flex p
+[@media(width>=100px)]:flex   @media (width>=100px) { ... }
+*:flex                 :is(.\*\:flex > *)
+before:block           .before\:block::before { content: var(--lm-content); display: block; }
+dark:hover:flex        @media (prefers-color-scheme: dark) { @media (hover: hover) { .dark\:hover\:flex:hover { ... } } }
+```
+
+### 16.4 Custom Utilities and `@apply`
+
+Stylesheet:
 
 ```css
 @utility tab-* {
@@ -1016,10 +1789,19 @@ tailwindcss [build] [--input input.css] [--output output.css] [--watch] [--poll=
   tab-size: --value(--tab-size-*);
   tab-size: --value([integer]);
 }
-@utility content-auto { content-visibility: auto; }
-.btn { @apply rounded-lg px-4 py-2 hover:bg-red-500; }
+@utility content-auto {
+  content-visibility: auto;
+}
+.btn {
+  @apply rounded-lg px-4 py-2 hover:bg-red-500;
+}
+@loom utilities;
 ```
-候補 `tab-4 tab-[8] content-auto` →
+
+Candidates: `tab-4`, `tab-[8]`, `content-auto`.
+
+Output:
+
 ```css
 .btn {
   border-radius: var(--radius-lg);
@@ -1042,59 +1824,128 @@ tailwindcss [build] [--input input.css] [--output output.css] [--watch] [--poll=
 }
 ```
 
-### 13.5 テーマ操作
+### 16.5 Theme Customization
 
 ```css
-@import "tailwindcss";
+@import "loom";
 @theme {
-  --color-*: initial;            /* デフォルトの色を全部消す */
+  --color-*: initial;
   --color-primary: oklch(0.6 0.2 250);
-  --breakpoint-3xl: 120rem;      /* 3xl: バリアントが増える */
+  --breakpoint-3xl: 120rem;
   --font-display: "Inter", sans-serif;
 }
 @custom-variant dark (&:where(.dark, .dark *));
 ```
 
-- `bg-primary`、`3xl:flex`、`font-display` が使える。`bg-red-500` は無効になる。
-- `dark:` はメディアクエリではなくクラスセレクタになる。
+- `bg-primary`, `3xl:flex`, and `font-display` compile; `bg-red-500` does not.
+- `dark:` produces a class-based selector instead of a media query.
 
----
+## 17. Test and Validation Matrix
 
-## 14. ユーティリティ関数 (共通部品)
+A conforming implementation SHOULD include tests that cover the behaviors defined in this
+specification.
 
-### 14.1 `segment(input, sep)`
+### 17.1 Stylesheet Parsing and Serialization
 
-区切り文字で分割するが、`(…)` `[…]` `{…}`、引用符の内側、`\` エスケープ直後の文字は無視する。閉じ括弧はスタック先頭と一致するときだけポップする。
+- Nested rules, nested at-rules, and `&` parse into the documented node shapes
+- Ordinary comments are dropped and `/*!` comments are kept
+- `!important` is split from values
+- A missing trailing `;` before `}` is accepted
+- Unbalanced blocks raise a positioned syntax error
+- Serialization matches Section 5.2 byte for byte
 
-### 14.2 `escape(ident)` / `unescape`
+### 17.2 Directives
 
-`CSS.escape` と同等。先頭の数字、`-` の後の数字、制御文字は `\<hex> ` 形式、英数字 `-` `_` と非 ASCII はそのまま、それ以外は `\` を前置。
+- `@import` with `layer()`, `supports()`, and media queries wraps content in the documented order
+- `layer()` after `supports()` raises an error
+- `url()`, `data:`, and `http(s)` imports are preserved verbatim
+- `@reference` behaves like `@import ... reference` and prints nothing
+- `@import "loom" important`, `prefix(...)`, `source(...)`, and `theme(reference)` take effect
+- `@theme` rejects non-custom-property children with a snippet in the error
+- `--color-*: initial` clears the namespace but keeps ignored sub-namespaces
+- `@theme default` values lose to author values regardless of order
+- `@source`, `@source not`, `@source inline(...)` with brace expansion, and
+  `@source not inline(...)` behave as specified and raise the documented errors
+- `@custom-variant` selector form, body form with `@slot`, at-rule selectors, dependency ordering,
+  and cycle detection
+- `@utility` static and functional forms, invalid names, empty bodies, and `--value` /
+  `--modifier` rules including `ratio` exclusivity
+- Nested `@variant` with comma alternatives and colon stacking; unknown names raise
+- `@apply` inlines utilities, keeps variant wrappers, ignores mixins, rejects mixed arguments,
+  rejects unknown candidates with the documented messages, and detects cycles
+- `--spacing()`, `--alpha()`, `--theme()` with fallbacks and `inline`, and legacy `theme()`
 
-### 14.3 `isValidArbitrary(value)`
+### 17.3 Candidate Parsing
 
-括弧 (`(` `[`) の対応を追跡し、対応しない閉じ括弧 (`)` `]` `}`)、トップレベルの `;` があれば false。`{` はスタックに積まない (トップレベルの `}` は false)。引用符内・エスケープはスキップ。
+- Static, functional, arbitrary property, arbitrary value, and variable shorthand forms
+- Type hints, empty arbitrary values, and `;` or `}` inside arbitrary values
+- Modifiers in named, bracket, and parenthesis forms; more than one modifier is invalid
+- Fractions are recorded only for named modifiers
+- Leading and trailing `!`
+- Prefix enforcement when a prefix is configured
+- `findRoots` yields every valid split and stops on an empty remainder
+- Underscore decoding, `\_`, `url()` and `var()` exemptions, and math operator spacing
 
-### 14.4 数値述語
+### 17.4 Variants and Utilities
 
-- `isPositiveInteger(v)`: `Number(v)` が整数かつ `>= 0` かつ `String(Number(v)) === v` (先頭ゼロ等を拒否)。
-- `isStrictPositiveInteger`: `> 0`。
-- `isValidSpacingMultiplier(v)` / `isValidOpacityValue(v)`: 0.25 の倍数で、余分な先頭・末尾ゼロが無い。
+- Every built-in variant in Section 9.5 produces the documented output
+- Compound variants reject incompatible inner variants and relative arbitrary selectors at the
+  top level
+- `not` rejects inner variants that yield more than one rule
+- Breakpoint and container groups sort ascending or descending by value
+- Every utility in Section 10.8 produces the documented declarations for named, arbitrary,
+  negative, fraction, and default forms
+- Opacity modifiers use `color-mix` and reject non-quarter values
+- `text-*` line-height modifiers and `bg-*` type inference
 
-### 14.5 `compare(a, z)`
+### 17.5 Compilation and Output
 
-文字列を先頭から比較し、両方が数字列の位置では数値として比較する自然順比較。
+- Output order is independent of candidate discovery order
+- Variant order, property order, declaration count, and natural name order act as tie breakers
+- `important` from the stylesheet and from candidates marks declarations, except inside
+  hoisted registrations
+- `@property` registrations print once and are hoisted to the end
+- Unused theme variables and keyframes are pruned; `static` values and values referenced by
+  scanned `--name` candidates survive
+- Nesting is flattened as specified
+- `build` returns identical output for a second call with no new candidates
 
----
+### 17.6 Scanning and CLI
 
-## 15. 実装順序の提案
+- Auto-detection respects `.gitignore` and the built-in ignore lists; explicit globs bypass them
+- Extraction finds candidates in HTML attributes, template literals, and object keys and respects
+  boundary rules
+- `scanFiles` returns only new candidates
+- Single build writes to a file or stdout; stdout is skipped when unchanged
+- Missing input and identical input and output exit with status 1
+- Watch mode performs incremental rebuilds for source changes and full rebuilds for stylesheet
+  changes, and keeps running after an error
+- Polling mode rebuilds on modification time changes
 
-1. §3 AST とパーサ、§3.3 `toCss`、§14 部品。
-2. §6 テーマ、§4.3 `@theme`、§4.1 `@import` (同梱 CSS の読み込み)。
-3. §7 候補パース (静的・関数的・任意値・modifier)、§7.5 ヘルパー、§7.9 のうち spacing / color / 静的レイアウト。
-4. §9 コンパイルとソート、§10 最適化 (未使用変数削除、ネスト展開)。ここで §13.1〜13.2 が通る。
-5. §8 バリアント (静的 → メディア → functional → compound)。§13.3 が通る。
-6. §4.5〜4.10 (`@custom-variant`、`@utility`、`@variant`、`@apply`、テーマ関数)。§13.4〜13.5 が通る。
-7. §11 走査・抽出、§12 CLI (単発ビルド → watch → poll → minify)。
-8. 残りのユーティリティを `src/utilities.ts` の順に追加。ポリフィルは最後。
+## 18. Implementation Checklist (Definition of Done)
 
-テストは参照実装のテスト (`src/*.test.ts`、特に `index.test.ts`、`candidate.test.ts`、`variants.test.ts`、`utilities.test.ts`、`apply.test.ts`、`css-functions.test.ts`) の入力と期待値をそのまま移植できる。ただし `run()` ヘルパーは Lightning CSS で整形しているため、期待値は `@media (width >= …)` が `(min-width: …)` に変換される等の差分を考慮すること。
+### 18.1 REQUIRED for Conformance
+
+- CSS parser and serializer per Section 5
+- Import resolution with a loader callback and the bundled `index.css`, `theme.css`,
+  `preflight.css`, and `utilities.css`
+- `@theme` with all four modes, namespace clearing, ignored sub-namespaces, and prefixing
+- `@source` in all four forms with brace expansion
+- `@custom-variant` in both forms with dependency ordering
+- `@utility` static and functional forms with `--value` and `--modifier`
+- Nested `@variant`, `@apply`, and the four theme functions
+- Candidate parser per Section 8 with memoization
+- Variant registry, built-in variants in the documented order, compound application, and
+  ordering per Section 9
+- Utility registry, definition helpers, color handling, and the catalog in Section 10.8
+- Compilation, importance, and ordering per Section 11 with the global property order
+- Optimization per Section 12 including pruning and flattening
+- Scanner with auto-detection, explicit globs, incremental scanning, and the extraction rules
+- CLI with single build, event-driven watch, polling watch, and the documented flags
+
+### 18.2 RECOMMENDED Extensions
+
+- The property registration and color-mix polyfills of Section 12.4
+- The additional utility families named at the end of Section 10.8
+- A minifier that downlevels media range syntax and nesting for older browsers
+- Warnings for unsupported `--value` data types with a caret pointing at the offending argument
