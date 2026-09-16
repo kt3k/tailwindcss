@@ -1,4 +1,4 @@
-# Loom Compiler Specification
+# Twill Compiler Specification
 
 Status: Draft v1 (language-agnostic)
 
@@ -16,8 +16,8 @@ behavior.
 
 ## 1. Problem Statement
 
-Loom is a utility-first CSS compiler. Authors write markup that uses short, composable class names
-such as `flex`, `p-4`, `bg-red-500/50`, or `md:hover:underline`. Loom reads one entry stylesheet,
+Twill is a utility-first CSS compiler. Authors write markup that uses short, composable class names
+such as `flex`, `p-4`, `bg-red-500/50`, or `md:hover:underline`. Twill reads one entry stylesheet,
 scans the project's source files for class names that look like utilities, and emits only the CSS
 rules that those class names require.
 
@@ -33,8 +33,8 @@ The compiler solves four problems:
 
 Important boundary:
 
-- Loom reads source files but never modifies them.
-- Loom's output is deterministic: the same stylesheet and the same candidate set always produce the
+- Twill reads source files but never modifies them.
+- Twill's output is deterministic: the same stylesheet and the same candidate set always produce the
   same CSS, byte for byte, regardless of the order in which candidates were discovered.
 - Class names that do not resolve to a utility produce no output and no error. Only the stylesheet
   itself can produce compile errors.
@@ -70,7 +70,7 @@ Important boundary:
 
 3. `Directive Collector`
    - Walks the AST once and registers `@theme`, `@source`, `@utility`, `@custom-variant`,
-     `@variant`, and `@loom utilities`.
+     `@variant`, and `@twill utilities`.
    - Removes directives that must not appear in the output.
 
 4. `Theme`
@@ -263,7 +263,7 @@ Returned by `compile` (Section 15.1).
 
 - `sources` (list of `Source Entry` collected from `@source`)
 - `root` (`null`, the string `none`, or a `Source Entry` without `negated`; from
-  `@loom utilities source(...)`)
+  `@twill utilities source(...)`)
 - `features` (bit set: `AT_APPLY` = 1, `AT_IMPORT` = 2, `THEME_FUNCTION` = 8, `UTILITIES` = 16,
   `VARIANTS` = 32, `AT_THEME` = 64)
 - `build(candidates)` (function from a list of raw strings to CSS text)
@@ -359,7 +359,7 @@ order:
 7. Expand nested `@variant` blocks (Section 6.9).
 8. Substitute theme functions (Section 6.11).
 9. Expand `@apply` (Section 6.10).
-10. Convert the `@loom utilities` node into an empty `context` node; `build` fills it later.
+10. Convert the `@twill utilities` node into an empty `context` node; `build` fills it later.
 11. Remove any remaining `@utility` nodes.
 
 ### 6.2 `@import` and `@reference`
@@ -388,12 +388,12 @@ every parameter is consumed the `@media` wrapper is removed and its children are
   include `reference`, any non-`@theme` rule inside MUST raise an error.
 - `prefix(<ident>)`: append `prefix(<ident>)` to every `@theme` inside.
 - `important`: set the design system's `important` flag.
-- `source(<path>)`: rewrite the first `@loom utilities` inside to `@loom utilities source(<path>)`
+- `source(<path>)`: rewrite the first `@twill utilities` inside to `@twill utilities source(<path>)`
   and wrap it in `context { sourceBase: <base of the importing file> }`.
 
 ### 6.3 Bundled Stylesheets
 
-An implementation MUST ship four stylesheets and MUST resolve the import id `loom` to the entry
+An implementation MUST ship four stylesheets and MUST resolve the import id `twill` to the entry
 file among them:
 
 - `index.css`: `@layer theme, base, components, utilities;` followed by `@import './theme.css'
@@ -404,7 +404,7 @@ file among them:
   sub-keys, font weights, tracking, leading, radii, shadows, easing curves, animations with their
   `@keyframes`, blur values, and `--default-*` settings.
 - `preflight.css`: base element resets.
-- `utilities.css`: the single statement `@loom utilities;`.
+- `utilities.css`: the single statement `@twill utilities;`.
 
 The default theme values that this specification's examples depend on are:
 
@@ -419,7 +419,7 @@ The default theme values that this specification's examples depend on are:
 - `--default-transition-duration: 150ms`
 - `--default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1)`
 
-### 6.4 `@loom utilities [source(...)]`
+### 6.4 `@twill utilities [source(...)]`
 
 - Only the first occurrence is kept; later occurrences MUST be removed.
 - An occurrence inside `context { reference: true }` MUST be removed and ignored.
@@ -846,8 +846,8 @@ name, what it wraps the utility's nodes in, and the `compounds` value when it is
 - `backdrop`: `&::backdrop`; `NEVER`.
 - `details-content`: `&::details-content`; `NEVER`.
 - `before` and `after`: `&::before` (or `&::after`) whose children are an `at-root` holding
-  `@property --lm-content { syntax: "*"; initial-value: ""; inherits: false; }`, then
-  `content: var(--lm-content);`, then the utility's nodes; `NEVER`.
+  `@property --tw-content { syntax: "*"; initial-value: ""; inherits: false; }`, then
+  `content: var(--tw-content);`, then the utility's nodes; `NEVER`.
 - `first`, `last`, `only`, `odd`, `even`, `first-of-type`, `last-of-type`, `only-of-type`:
   `&:first-child`, `&:last-child`, `&:only-child`, `&:nth-child(odd)`, `&:nth-child(even)`,
   `&:first-of-type`, `&:last-of-type`, `&:only-of-type`.
@@ -874,7 +874,7 @@ name, what it wraps the utility's nodes in, and the `compounds` value when it is
   value MUST be a positive integer; an arbitrary value is used verbatim.
 - `supports-<v>` (functional; `AT_RULES`): when the value matches `^[\w-]*\s*\(` it is used as the
   condition verbatim except that bare `and`, `or`, and `not` function names receive surrounding
-  spaces; when the value contains no `:` it becomes `(<v>: var(--lm))`; otherwise it is wrapped
+  spaces; when the value contains no `:` it becomes `(<v>: var(--tw))`; otherwise it is wrapped
   in parentheses unless already parenthesized. Wrap in `@supports <condition>`.
 - `motion-safe`, `motion-reduce`: `@media (prefers-reduced-motion: no-preference)`,
   `@media (prefers-reduced-motion: reduce)`; `AT_RULES`.
@@ -992,7 +992,7 @@ returning `--spacing(-<v>)` under the same conditions. Theme function substituti
 ### 10.4 Custom Property Registrations
 
 Utilities that compose through internal variables (for example font weight) emit an `at-root`
-node containing `@property --lm-<name> { syntax: "*"; inherits: false; [initial-value: <v>;] }`
+node containing `@property --tw-<name> { syntax: "*"; inherits: false; [initial-value: <v>;] }`
 alongside their declarations. The optimizer prints each registration once (Section 12.1).
 
 ### 10.5 Utility Name Rules for `@utility`
@@ -1121,7 +1121,7 @@ Sizing:
 - `w`, `min-w`, `max-w`: `spacingUtility` (`--width` or `--min-width` or `--max-width`,
   `--spacing`, `--container`) with fractions; `h`, `min-h`, `max-h` (`--height` and friends,
   `--spacing`) with fractions; `size-*` sets `width` and `height` together and emits
-  `--lm-sort: size` first.
+  `--tw-sort: size` first.
 - Static sizes: `w-auto`, `w-full`, `w-screen`, `w-svw`, `w-lvw`, `w-dvw`, `w-min`, `w-max`,
   `w-fit`, and the `h-*` counterparts with `vh` units.
 
@@ -1130,12 +1130,12 @@ Typography:
 - `font-<family>`: `font-family` from `--font-*` with the sub-keys `--font-feature-settings` and
   `--font-variation-settings` emitted as `font-feature-settings` and `font-variation-settings`
   when present.
-- `font-<weight>`: from `--font-weight-*`; emits `at-root @property --lm-font-weight`,
-  `--lm-font-weight: <value>`, and `font-weight: <value>`. An arbitrary value infers `number`
+- `font-<weight>`: from `--font-weight-*`; emits `at-root @property --tw-font-weight`,
+  `--tw-font-weight: <value>`, and `font-weight: <value>`. An arbitrary value infers `number`
   (weight) versus `family-name` or `generic-name` (family).
 - `text-<size>`: from `--text-*` with sub-keys `--line-height`, `--letter-spacing`,
-  `--font-weight`; emits `font-size`, then `line-height: var(--lm-leading, <sub>)`,
-  `letter-spacing: var(--lm-tracking, <sub>)`, `font-weight: var(--lm-font-weight, <sub>)` for
+  `--font-weight`; emits `font-size`, then `line-height: var(--tw-leading, <sub>)`,
+  `letter-spacing: var(--tw-tracking, <sub>)`, `font-weight: var(--tw-font-weight, <sub>)` for
   the sub-keys that exist. A modifier `/<leading>` resolves against `--leading`, then as a
   spacing multiplier (`--spacing(<n>)`), then `none` as `1`, and replaces the line-height
   declaration; an unresolvable modifier invalidates the candidate.
@@ -1144,8 +1144,8 @@ Typography:
 - `text-left`, `text-center`, `text-right`, `text-justify`, `text-start`, `text-end`:
   `text-align`.
 - `leading-*`: `spacingUtility` (`--leading`, `--spacing`) emitting `at-root @property
-  --lm-leading`, `--lm-leading: <v>`, `line-height: <v>`; `leading-none` is `1`.
-- `tracking-*`: `letter-spacing` (`--tracking`); negative supported; emits `--lm-tracking`.
+  --tw-leading`, `--tw-leading: <v>`, `line-height: <v>`; `leading-none` is `1`.
+- `tracking-*`: `letter-spacing` (`--tracking`); negative supported; emits `--tw-tracking`.
 - `uppercase`, `lowercase`, `capitalize`, `normal-case`: `text-transform`.
 - `italic`, `not-italic`: `font-style`.
 - `underline`, `overline`, `line-through`, `no-underline`: `text-decoration-line`.
@@ -1177,10 +1177,10 @@ Backgrounds and borders:
   (`--border-color`, `--color`) gives the color declarations; a named width from
   `--border-width` or a bare non-negative integer `<n>` (as `<n>px`) gives width; an arbitrary
   value infers `color`, `line-width`, `length`. Width output is `at-root @property
-  --lm-border-style { initial-value: solid }`, then `border-style: var(--lm-border-style)`, then
+  --tw-border-style { initial-value: solid }`, then `border-style: var(--tw-border-style)`, then
   the `border-width` (or side-specific width) declaration.
 - `border-solid`, `border-dashed`, `border-dotted`, `border-double`, `border-hidden`,
-  `border-none`: `--lm-border-style: <v>; border-style: <v>`.
+  `border-none`: `--tw-border-style: <v>; border-style: <v>`.
 - `rounded`, `rounded-s`, `rounded-e`, `rounded-t`, `rounded-r`, `rounded-b`, `rounded-l`,
   `rounded-ss`, `rounded-se`, `rounded-ee`, `rounded-es`, `rounded-tl`, `rounded-tr`,
   `rounded-br`, `rounded-bl`: `functionalUtility` (`--radius`) on the corresponding
@@ -1192,7 +1192,7 @@ Effects, transitions, interactivity:
 - `opacity-<n>`: `opacity` (`--opacity`); a bare value that is a multiple of 0.25 becomes
   `<n>%`.
 - `transition`: `transition-property: color, background-color, border-color, outline-color,
-  text-decoration-color, fill, stroke, --lm-gradient-from, --lm-gradient-via, --lm-gradient-to,
+  text-decoration-color, fill, stroke, --tw-gradient-from, --tw-gradient-via, --tw-gradient-to,
   opacity, box-shadow, transform, translate, scale, rotate, filter, -webkit-backdrop-filter,
   backdrop-filter, display, content-visibility, overlay, pointer-events` followed by
   `transition-timing-function: var(--default-transition-timing-function)` and
@@ -1204,7 +1204,7 @@ Effects, transitions, interactivity:
 - `animate-*`: `animation` (`--animate`); `animate-none`.
 - `cursor-*`, `select-{none,text,all,auto}`, `pointer-events-{none,auto}`, `resize`,
   `resize-{none,x,y}`, `appearance-{none,auto}`, `scroll-{auto,smooth}`, `will-change-*`,
-  `content-[...]` (`--lm-content` plus `content`), `aspect-*` (`--aspect`; `ratio` values as
+  `content-[...]` (`--tw-content` plus `content`), `aspect-*` (`--aspect`; `ratio` values as
   `a / b`; `aspect-square`, `aspect-video`, `aspect-auto`), `columns-*`, `object-{contain,
   cover,fill,none,scale-down}`, `accent-*`, `caret-*`, `fill-*`, `stroke-*` (`colorUtility`).
 
@@ -1249,7 +1249,7 @@ flag applies; `onInvalidCandidate` receives each invalid raw candidate.
 
 - Walk the nodes breadth first. Count every declaration with a defined value (`count`).
 - For each declaration, look up its property in the global property order (Section 11.4). Add
-  the index when found. A declaration `--lm-sort: <property>` contributes the index of
+  the index when found. A declaration `--tw-sort: <property>` contributes the index of
   `<property>` and stops further property lookups for this node list.
 - `order` is the sorted list of collected indices.
 
@@ -1269,15 +1269,15 @@ implementation MUST use this list verbatim.
 container-type pointer-events visibility position inset inset-inline inset-block
 inset-inline-start inset-inline-end inset-block-start inset-block-end top right bottom left
 isolation z-index order grid-column grid-column-start grid-column-end grid-row grid-row-start
-grid-row-end float clear --lm-container-component margin margin-inline margin-block
+grid-row-end float clear --tw-container-component margin margin-inline margin-block
 margin-inline-start margin-inline-end margin-block-start margin-block-end margin-top margin-right
 margin-bottom margin-left box-sizing display field-sizing aspect-ratio height max-height
 min-height width max-width min-width flex flex-shrink flex-grow flex-basis table-layout
-caption-side border-collapse border-spacing --lm-border-spacing-x --lm-border-spacing-y
-transform-origin translate --lm-translate-x --lm-translate-y --lm-translate-z scale --lm-scale-x
---lm-scale-y --lm-scale-z rotate --lm-rotate-x --lm-rotate-y --lm-rotate-z --lm-skew-x
---lm-skew-y transform zoom animation cursor touch-action --lm-pan-x --lm-pan-y --lm-pinch-zoom
-resize scroll-snap-type --lm-scroll-snap-strictness scroll-snap-align scroll-snap-stop
+caption-side border-collapse border-spacing --tw-border-spacing-x --tw-border-spacing-y
+transform-origin translate --tw-translate-x --tw-translate-y --tw-translate-z scale --tw-scale-x
+--tw-scale-y --tw-scale-z rotate --tw-rotate-x --tw-rotate-y --tw-rotate-z --tw-skew-x
+--tw-skew-y transform zoom animation cursor touch-action --tw-pan-x --tw-pan-y --tw-pinch-zoom
+resize scroll-snap-type --tw-scroll-snap-strictness scroll-snap-align scroll-snap-stop
 scroll-margin scroll-margin-inline scroll-margin-block scroll-margin-inline-start
 scroll-margin-inline-end scroll-margin-block-start scroll-margin-block-end scroll-margin-top
 scroll-margin-right scroll-margin-bottom scroll-margin-left scroll-padding scroll-padding-inline
@@ -1287,8 +1287,8 @@ scroll-padding-bottom scroll-padding-left scrollbar-width scrollbar-color scroll
 list-style-position list-style-type list-style-image appearance columns break-before
 break-inside break-after grid-auto-columns grid-auto-flow grid-auto-rows grid-template-columns
 grid-template-rows flex-direction flex-wrap place-content place-items align-content align-items
-justify-content justify-items gap column-gap row-gap --lm-space-x-reverse --lm-space-y-reverse
-divide-x-width divide-y-width --lm-divide-y-reverse divide-style divide-color place-self
+justify-content justify-items gap column-gap row-gap --tw-space-x-reverse --tw-space-y-reverse
+divide-x-width divide-y-width --tw-divide-y-reverse divide-style divide-color place-self
 align-self justify-self overflow overflow-x overflow-y overscroll-behavior overscroll-behavior-x
 overscroll-behavior-y scroll-behavior border-radius border-start-radius border-end-radius
 border-top-radius border-right-radius border-bottom-radius border-left-radius
@@ -1302,22 +1302,22 @@ border-inline-end-style border-block-start-style border-block-end-style border-t
 border-right-style border-bottom-style border-left-style border-color border-inline-color
 border-block-color border-inline-start-color border-inline-end-color border-block-start-color
 border-block-end-color border-top-color border-right-color border-bottom-color
-border-left-color background-color background-image --lm-gradient-position
---lm-gradient-stops --lm-gradient-via-stops --lm-gradient-from --lm-gradient-from-position
---lm-gradient-via --lm-gradient-via-position --lm-gradient-to --lm-gradient-to-position
-mask-image --lm-mask-top --lm-mask-top-from-color --lm-mask-top-from-position
---lm-mask-top-to-color --lm-mask-top-to-position --lm-mask-right --lm-mask-right-from-color
---lm-mask-right-from-position --lm-mask-right-to-color --lm-mask-right-to-position
---lm-mask-bottom --lm-mask-bottom-from-color --lm-mask-bottom-from-position
---lm-mask-bottom-to-color --lm-mask-bottom-to-position --lm-mask-left --lm-mask-left-from-color
---lm-mask-left-from-position --lm-mask-left-to-color --lm-mask-left-to-position
---lm-mask-linear --lm-mask-linear-position --lm-mask-linear-from-color
---lm-mask-linear-from-position --lm-mask-linear-to-color --lm-mask-linear-to-position
---lm-mask-radial --lm-mask-radial-shape --lm-mask-radial-size --lm-mask-radial-position
---lm-mask-radial-from-color --lm-mask-radial-from-position --lm-mask-radial-to-color
---lm-mask-radial-to-position --lm-mask-conic --lm-mask-conic-position
---lm-mask-conic-from-color --lm-mask-conic-from-position --lm-mask-conic-to-color
---lm-mask-conic-to-position box-decoration-break background-size background-attachment
+border-left-color background-color background-image --tw-gradient-position
+--tw-gradient-stops --tw-gradient-via-stops --tw-gradient-from --tw-gradient-from-position
+--tw-gradient-via --tw-gradient-via-position --tw-gradient-to --tw-gradient-to-position
+mask-image --tw-mask-top --tw-mask-top-from-color --tw-mask-top-from-position
+--tw-mask-top-to-color --tw-mask-top-to-position --tw-mask-right --tw-mask-right-from-color
+--tw-mask-right-from-position --tw-mask-right-to-color --tw-mask-right-to-position
+--tw-mask-bottom --tw-mask-bottom-from-color --tw-mask-bottom-from-position
+--tw-mask-bottom-to-color --tw-mask-bottom-to-position --tw-mask-left --tw-mask-left-from-color
+--tw-mask-left-from-position --tw-mask-left-to-color --tw-mask-left-to-position
+--tw-mask-linear --tw-mask-linear-position --tw-mask-linear-from-color
+--tw-mask-linear-from-position --tw-mask-linear-to-color --tw-mask-linear-to-position
+--tw-mask-radial --tw-mask-radial-shape --tw-mask-radial-size --tw-mask-radial-position
+--tw-mask-radial-from-color --tw-mask-radial-from-position --tw-mask-radial-to-color
+--tw-mask-radial-to-position --tw-mask-conic --tw-mask-conic-position
+--tw-mask-conic-from-color --tw-mask-conic-from-position --tw-mask-conic-to-color
+--tw-mask-conic-to-position box-decoration-break background-size background-attachment
 background-clip background-position background-repeat background-origin mask-composite
 mask-mode mask-type mask-size mask-clip mask-position mask-repeat mask-origin fill stroke
 stroke-width object-fit object-position padding padding-inline padding-block
@@ -1328,14 +1328,14 @@ word-break text-overflow hyphens white-space tab-size color text-transform font-
 font-stretch font-variant-numeric text-decoration-line text-decoration-color
 text-decoration-style text-decoration-thickness text-underline-offset -webkit-font-smoothing
 placeholder-color caret-color accent-color color-scheme opacity background-blend-mode
-mix-blend-mode box-shadow --lm-shadow --lm-shadow-color --lm-ring-shadow --lm-ring-color
---lm-inset-shadow --lm-inset-shadow-color --lm-inset-ring-shadow --lm-inset-ring-color
---lm-ring-offset-width --lm-ring-offset-color outline outline-width outline-offset
-outline-color --lm-blur --lm-brightness --lm-contrast --lm-drop-shadow --lm-grayscale
---lm-hue-rotate --lm-invert --lm-saturate --lm-sepia filter --lm-backdrop-blur
---lm-backdrop-brightness --lm-backdrop-contrast --lm-backdrop-grayscale
---lm-backdrop-hue-rotate --lm-backdrop-invert --lm-backdrop-opacity --lm-backdrop-saturate
---lm-backdrop-sepia backdrop-filter transition-property transition-behavior transition-delay
+mix-blend-mode box-shadow --tw-shadow --tw-shadow-color --tw-ring-shadow --tw-ring-color
+--tw-inset-shadow --tw-inset-shadow-color --tw-inset-ring-shadow --tw-inset-ring-color
+--tw-ring-offset-width --tw-ring-offset-color outline outline-width outline-offset
+outline-color --tw-blur --tw-brightness --tw-contrast --tw-drop-shadow --tw-grayscale
+--tw-hue-rotate --tw-invert --tw-saturate --tw-sepia filter --tw-backdrop-blur
+--tw-backdrop-brightness --tw-backdrop-contrast --tw-backdrop-grayscale
+--tw-backdrop-hue-rotate --tw-backdrop-invert --tw-backdrop-opacity --tw-backdrop-saturate
+--tw-backdrop-sepia backdrop-filter transition-property transition-behavior transition-delay
 transition-duration transition-timing-function will-change contain content
 forced-color-adjust
 ```
@@ -1349,7 +1349,7 @@ serialization.
 
 Build a new AST depth first:
 
-- Declaration: drop `--lm-sort` and undefined values. Inside `context { theme: true }` a `--`
+- Declaration: drop `--tw-sort` and undefined values. Inside `context { theme: true }` a `--`
   declaration is tracked for pruning (Section 7.6); a value of `initial` is dropped. When the
   value contains `var(`, record variable usage (as a dependency when the declaration is itself a
   theme variable, as a use otherwise). An `animation` declaration records keyframe names (split
@@ -1476,13 +1476,13 @@ Scan the input as bytes and emit every maximal span that satisfies:
 ### 14.1 Invocation
 
 ```text
-loom [build] [--input input.css] [--output output.css] [--watch] [--poll=ms] [options...]
+twill [build] [--input input.css] [--output output.css] [--watch] [--poll=ms] [options...]
 ```
 
 Options:
 
 - `-i, --input <path>`: entry stylesheet; `-` reads stdin. When omitted the input is the single
-  line `@import 'loom';`.
+  line `@import 'twill';`.
 - `-o, --output <path>`: output file; `-` (the default) writes stdout.
 - `-w, --watch [always]`: rebuild on changes. `always` keeps watching after stdin closes.
 - `--poll [ms]`: poll instead of using filesystem events; the default interval is 250 ms. A
@@ -1504,7 +1504,7 @@ Behavior:
 ### 14.2 Single Build
 
 1. Read the input. Call `compile(css, { base: dirname(input) or cwd, loadStylesheet })`. The
-   loader resolves relative ids against `base`, resolves the id `loom` to the bundled
+   loader resolves relative ids against `base`, resolves the id `twill` to the bundled
    `index.css`, and records every loaded path as a full-rebuild path.
 2. Assemble sources (Section 13.1) and create the scanner.
 3. `candidates = scanner.scan()`; `css = compiler.build(candidates)`; write (Section 14.5).
@@ -1676,7 +1676,7 @@ Stylesheet:
   --breakpoint-md: 768px;
 }
 @layer utilities {
-  @loom utilities;
+  @twill utilities;
 }
 ```
 
@@ -1731,16 +1731,16 @@ bg-red-500/50        background-color: color-mix(in oklab, var(--color-red-500) 
 bg-[#0088cc]         background-color: #0088cc;
 bg-[url(/a_b.png)]   background-image: url(/a_b.png);
 bg-[length:10px_20px] background-size: 10px 20px;
-text-lg              font-size: var(--text-lg); line-height: var(--lm-leading, var(--text-lg--line-height));
+text-lg              font-size: var(--text-lg); line-height: var(--tw-leading, var(--text-lg--line-height));
 text-lg/8            font-size: var(--text-lg); line-height: calc(var(--spacing) * 8);
 text-red-500         color: var(--color-red-500);
-font-bold            --lm-font-weight: var(--font-weight-bold); font-weight: var(--font-weight-bold);
-                     (plus a hoisted @property --lm-font-weight)
+font-bold            --tw-font-weight: var(--font-weight-bold); font-weight: var(--font-weight-bold);
+                     (plus a hoisted @property --tw-font-weight)
 rounded-lg           border-radius: var(--radius-lg);
 rounded-full         border-radius: calc(infinity * 1px);
-border               border-style: var(--lm-border-style); border-width: 1px;
-                     (plus a hoisted @property --lm-border-style with initial-value: solid)
-border-2             border-style: var(--lm-border-style); border-width: 2px;
+border               border-style: var(--tw-border-style); border-width: 1px;
+                     (plus a hoisted @property --tw-border-style with initial-value: solid)
+border-2             border-style: var(--tw-border-style); border-width: 2px;
 z-10                 z-index: 10;
 -z-10                z-index: calc(10 * -1);
 flex-1               flex: 1;
@@ -1768,14 +1768,14 @@ peer-checked:flex      .peer-checked\:flex:is(:where(.peer):checked ~ *)
 has-[>img]:flex        .has-\[\>img\]\:flex:has(> img)
 in-data-visible:flex   :where([data-visible]) .in-data-visible\:flex
 not-hover:flex         .not-hover\:flex:not(:hover)  and  @media not all and (hover: hover) { .not-hover\:flex { ... } }
-not-supports-grid:flex @supports not (grid: var(--lm)) { ... }
+not-supports-grid:flex @supports not (grid: var(--tw)) { ... }
 data-[state=open]:flex .data-\[state\=open\]\:flex[data-state="open"]
 aria-checked:flex      .aria-checked\:flex[aria-checked="true"]
 nth-3:flex             .nth-3\:flex:nth-child(3)
 [&_p]:flex             .\[\&_p\]\:flex p
 [@media(width>=100px)]:flex   @media (width>=100px) { ... }
 *:flex                 :is(.\*\:flex > *)
-before:block           .before\:block::before { content: var(--lm-content); display: block; }
+before:block           .before\:block::before { content: var(--tw-content); display: block; }
 dark:hover:flex        @media (prefers-color-scheme: dark) { @media (hover: hover) { .dark\:hover\:flex:hover { ... } } }
 ```
 
@@ -1795,7 +1795,7 @@ Stylesheet:
 .btn {
   @apply rounded-lg px-4 py-2 hover:bg-red-500;
 }
-@loom utilities;
+@twill utilities;
 ```
 
 Candidates: `tab-4`, `tab-[8]`, `content-auto`.
@@ -1827,7 +1827,7 @@ Output:
 ### 16.5 Theme Customization
 
 ```css
-@import "loom";
+@import "twill";
 @theme {
   --color-*: initial;
   --color-primary: oklch(0.6 0.2 250);
@@ -1860,7 +1860,7 @@ specification.
 - `layer()` after `supports()` raises an error
 - `url()`, `data:`, and `http(s)` imports are preserved verbatim
 - `@reference` behaves like `@import ... reference` and prints nothing
-- `@import "loom" important`, `prefix(...)`, `source(...)`, and `theme(reference)` take effect
+- `@import "twill" important`, `prefix(...)`, `source(...)`, and `theme(reference)` take effect
 - `@theme` rejects non-custom-property children with a snippet in the error
 - `--color-*: initial` clears the namespace but keeps ignored sub-namespaces
 - `@theme default` values lose to author values regardless of order
